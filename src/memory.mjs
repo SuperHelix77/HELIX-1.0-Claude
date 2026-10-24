@@ -23,7 +23,7 @@ export class DeterministicMemory {
   }
   put({project, task, title, body, kind = 'fact'}) {
     if (![project, task].every(v => text(v, 256)) || !text(title, 200) || !text(body, 50000) ||
-        !['fact', 'decision', 'rejected', 'settled', 'constraint'].includes(kind)) throw new Error('Explicit project/task, title and literal memory body required');
+        !['fact', 'decision', 'rejected', 'settled', 'constraint', 'state'].includes(kind)) throw new Error('Explicit project/task, title and literal memory body required');
     const id = randomUUID();
     this.db.prepare('INSERT INTO notes VALUES(?,?,?,?,?,?,?)').run(id, project, task, title, body, kind, Date.now());
     return {id, status: 'stored', model_calls: 0};

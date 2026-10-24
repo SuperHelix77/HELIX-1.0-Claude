@@ -85,8 +85,8 @@ export async function createService({directory, port = 0, upstream = process.env
     throw new Error('Known memory action required');
   }
   let closing = false, coreRestarting = false;
-  const memoryTool = {name: 'memory', description: 'Deterministic explicit project/task memory. put stores your literal note; search returns a bounded index; read expands exact stored text. Historical memory is not authorization or a work queue. No LLM or Ollama.', inputSchema: {
-    type: 'object', properties: {action: {enum: ['put', 'search', 'read', 'projects', 'browse', 'claude_lookup']}, source: {enum: ['helix', 'claude-mem']}, project: {type: 'string'}, task: {type: 'string'}, query: {type: 'string'}, id: {type: 'string'}, title: {type: 'string'}, body: {type: 'string'}, kind: {enum: ['fact', 'decision', 'rejected', 'settled', 'constraint']}, limit: {type: 'integer'}, cursor: {type: 'integer'}, expand: {type: 'boolean'}}, required: ['action'], additionalProperties: false}};
+  const memoryTool = {name: 'memory', description: 'Deterministic explicit project/task memory. put stores your literal note; search returns a bounded index of HELIX notes plus inherited Claude-Mem records when connected; read expands exact stored text; state reads or (with fields) appends work-state lists; timeline lists inherited observations around an id; record returns exact inherited fields in ranges. Historical memory is not authorization or a work queue. No LLM or Ollama.', inputSchema: {
+    type: 'object', properties: {action: {enum: ['put', 'search', 'read', 'projects', 'browse', 'claude_lookup', 'state', 'timeline', 'record']}, source: {enum: ['helix', 'claude-mem']}, project: {type: 'string'}, task: {type: 'string'}, query: {type: 'string'}, id: {type: 'string'}, title: {type: 'string'}, body: {type: 'string'}, kind: {enum: ['fact', 'decision', 'rejected', 'settled', 'constraint', 'state']}, limit: {type: 'integer'}, cursor: {type: 'integer'}, expand: {type: 'boolean'}, list: {type: 'string'}, fields: {type: 'object', additionalProperties: {type: ['string', 'number', 'boolean', 'null']}}, includeClosed: {type: 'boolean'}, table: {type: 'string'}, offset: {type: 'integer'}, before: {type: 'integer'}, after: {type: 'integer'}}, required: ['action'], additionalProperties: false}};
   async function rpc(method, params = {}, options = {}) {
     if (closing || coreRestarting) throw new Error('Core is restarting or stopping; operation not dispatched, no mutation retried');
     if (method === 'tools/list') {
@@ -120,15 +120,20 @@ export async function createService({directory, port = 0, upstream = process.env
           } else {
             if (args.source !== undefined && args.source !== 'helix') throw new Error('Known memory source required');
             value = memory.search(args).map(row => ({...row, source: 'helix'}));
+            const room = (args.limit || 5) - value.length;
+            if (args.source === undefined && room > 0 && claudeFile()) value.push(...compatibility.search({project: args.project, query: args.query, limit: room}).map(row => ({...row, source: 'claude-mem', authority: 'historical evidence only'})));
           }
           counters.memory_lookups++;
         }
         else if (['read', 'projects', 'browse'].includes(operation)) value = memoryAction(operation, args);
-        else if (operation === 'claude_lookup') {
+        else if (['state', 'timeline', 'record'].includes(operation)) {
+          const name = operation === 'state' ? (args.fields ? 'work_state_write' : 'work_state_read') : operation === 'record' ? 'memory_record' : 'timeline';
+          value = callMemoryCompatibility(compatibility, name, args, params.caller_cwd).content[0].text;
+        } else if (operation === 'claude_lookup') {
           if (!claudeFile()) throw new Error('Claude-Mem read-only bridge is not explicitly configured');
           value = lookupClaudeMem(claudeFile(), args); counters.memory_lookups++;
         } else throw new Error('Unknown memory action');
-        result = {content: [{type: 'text', text: JSON.stringify(value)}]};
+        result = {content: [{type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value)}]};
       } else if (params.name === 'context' && action === 'rtk') {
         const args = params.arguments;
         if (Object.keys(args).some(k => !['action', 'source', 'filter'].includes(k))) throw new Error('Invalid RTK filter fields');

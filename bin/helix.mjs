@@ -52,7 +52,7 @@ if (command === 'serve') {
       reply({jsonrpc: '2.0', id: message.id, error: {code: -32601, message: 'Unknown deterministic memory method or tool'}}); return;
     }
     const controller = new AbortController(); pending.set(message.id, controller);
-    const params = compatibility ? {...message.params, name: 'memory:' + message.params.name, caller_cwd: process.cwd()} : message.params;
+    const params = compatibility ? {...message.params, name: 'memory:' + message.params.name, caller_cwd: process.cwd()} : message.params?.name === 'memory' ? {...message.params, caller_cwd: process.cwd()} : message.params;
     request('/rpc', {value: {method: message.method, params}, signal: controller.signal})
       .then(result => reply({jsonrpc: '2.0', id: message.id, result}))
       .catch(error => reply({jsonrpc: '2.0', id: message.id, error: {code: -32603, message: error.message}}))

@@ -202,3 +202,28 @@ test('memory compatibility MCP routes share one service; capability rejects untr
     child.stdin.end(); await once(child, 'exit');
   } finally { await service.close(); }
 });
+
+test('Claude memory tool exposes inherited search, work state, timeline, exact records and state notes', async t => {
+  const {directory, source, db} = fixture(t); t.after(() => db.close());
+  for (const id of [2, 3, 4]) db.prepare('INSERT INTO observations(id,project,title,narrative) VALUES(?,?,?,?)').run(id, id === 3 ? 'other' : 'canonical', 'step ' + id, 'timeline narrative');
+  const home = path.join(directory, 'owned'); fs.mkdirSync(home, {mode: 0o700});
+  fs.writeFileSync(path.join(home, 'memory-bridge.json'), JSON.stringify({file: source}), {mode: 0o600});
+  const service = await createService({directory: home});
+  try {
+    const call = async args => (await request('/rpc', {directory: home, value: {method: 'tools/call', params: {name: 'memory', arguments: args, caller_cwd: directory}}})).content[0].text;
+    const schema = (await request('/rpc', {directory: home, value: {method: 'tools/list'}})).tools.find(tool => tool.name === 'memory').inputSchema.properties;
+    for (const action of ['state', 'timeline', 'record']) assert.ok(schema.action.enum.includes(action));
+    assert.ok(schema.kind.enum.includes('state'));
+    await call({action: 'put', project: 'canonical', task: 'clear', title: 'handoff', body: 'done; open; next', kind: 'state'});
+    assert.deepEqual(JSON.parse(await call({action: 'search', project: 'canonical', query: 'narrative'})).map(row => row.source), ['claude-mem', 'claude-mem']);
+    assert.equal(JSON.parse(await call({action: 'search', project: 'canonical', query: 'narrative', source: 'helix'})).length, 0);
+    assert.equal(JSON.parse(await call({action: 'search', project: 'canonical', query: 'open'}))[0].kind, 'state');
+    assert.deepEqual(JSON.parse(await call({action: 'timeline', id: 2, before: 1, after: 5})).map(row => [row.id, row.anchor]), [[1, false], [2, true], [4, false]]);
+    await assert.rejects(call({action: 'timeline', id: 'x'}), /window/);
+    assert.match(await call({action: 'state', list: 'current'}), /canonical/);
+    await call({action: 'state', list: 'current', fields: {task: 'now', status: 'done'}});
+    assert.match(await call({action: 'state', list: 'current'}), /No matching/);
+    assert.match(await call({action: 'record', table: 'observations', id: '4'}), /step 4/);
+    assert.equal(service.snapshot().counters.model_calls, 0);
+  } finally { await service.close(); }
+});

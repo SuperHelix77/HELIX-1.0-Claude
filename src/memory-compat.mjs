@@ -118,6 +118,17 @@ export class MemoryCompatibility {
     this.memory.db.prepare('INSERT INTO inherited_work_updates(project,list_name,fields,created) VALUES(?,?,?,?)').run(project, list, JSON.stringify(fields), Date.now());
     return this.readState({...args, fields: undefined});
   }
+  timeline({id, before = 3, after = 3, ...args}) {
+    if (!/^\d+$/.test(String(id)) || !Number.isSafeInteger(Number(id)) || ![before, after].every(n => Number.isInteger(n) && n >= 0 && n <= 20)) throw new Error('Inherited observation id and window of 0-20 required');
+    return this.withSource(db => {
+      if (!db) throw new Error('No inherited database connected');
+      const scope = this.projects(db, args), anchor = Number(id), where = `project COLLATE NOCASE IN (${marks(scope.read)})`;
+      const columns = ['id', 'project', 'type', 'title', 'created_at'].filter(name => db.prepare('PRAGMA table_info(observations)').all().some(row => row.name === name)).join(',');
+      const earlier = db.prepare(`SELECT ${columns} FROM observations WHERE ${where} AND id<? ORDER BY id DESC LIMIT ?`).all(...scope.read, anchor, before).reverse();
+      const later = db.prepare(`SELECT ${columns} FROM observations WHERE ${where} AND id>=? ORDER BY id LIMIT ?`).all(...scope.read, anchor, after + 1);
+      return [...earlier, ...later].map(row => ({...row, anchor: row.id === anchor}));
+    });
+  }
   record({table = 'observations', id, offset = 0, limit = 12000, project}) {
     if (!tables.has(table) || table !== 'helix' && (!Number.isSafeInteger(Number(id)) || !/^\d+$/.test(String(id))) || !Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 24000) throw new Error('Known memory table, id and bounded exact range required');
     const encode = row => {
@@ -166,6 +177,7 @@ export const memoryCompatibilityTools = [
   {name: 'work_state_write', description: 'Append explicit work-state fields to HELIX SQLite. No model worker.', inputSchema: {type: 'object', properties: {list: {type: 'string'}, fields: {type: 'object', additionalProperties: {type: ['string', 'number', 'boolean', 'null']}}}, required: ['list', 'fields'], additionalProperties: false}},
   {name: 'search', description: 'Bounded literal search of inherited observations, summaries and prompts. No embedding/model calls.', inputSchema: {type: 'object', properties: {query: {type: 'string'}, project: {type: 'string'}, limit: {type: 'integer'}, offset: {type: 'integer'}, type: {type: 'string'}, obs_type: {type: 'string'}, orderBy: {enum: ['date_asc', 'date_desc']}}, required: ['query'], additionalProperties: false}},
   {name: 'get_observations', description: 'Retrieve exact inherited observation fields by id. For long records use memory_record ranges.', inputSchema: {type: 'object', properties: {ids: {type: 'array', items: {type: 'integer'}, maxItems: 20}, project: {type: 'string'}}, required: ['ids'], additionalProperties: false}},
+  {name: 'timeline', description: 'Inherited observations around an id in the caller project, oldest first: ids, types and titles only. Expand with get_observations.', inputSchema: {type: 'object', properties: {id: {type: ['integer', 'string']}, before: {type: 'integer'}, after: {type: 'integer'}, project: {type: 'string'}}, required: ['id'], additionalProperties: false}},
   {name: 'memory_record', description: 'Recover every stored field of inherited records or new HELIX notes in exact bounded JSON ranges. Use table helix and the UUID for new notes.', inputSchema: {type: 'object', properties: {table: {enum: [...tables]}, id: {type: ['integer', 'string']}, offset: {type: 'integer'}, limit: {type: 'integer'}}, required: ['table', 'id'], additionalProperties: false}},
   {name: 'save_memory', description: 'Store an explicitly selected literal note in HELIX SQLite without an observer or model.', inputSchema: {type: 'object', properties: {project: {type: 'string'}, title: {type: 'string'}, text: {type: 'string'}}, required: ['text', 'title'], additionalProperties: false}},
 ];
@@ -180,7 +192,8 @@ export function callMemoryCompatibility(compat, name, args, cwd) {
   } else if (name === 'get_observations') {
     if (!Array.isArray(args.ids) || !args.ids.length || args.ids.length > 20) throw new Error('One to twenty observation ids required');
     value = args.ids.map(id => compat.record({id, project: args.project}));
-  } else if (name === 'memory_record') value = compat.record(args);
+  } else if (name === 'timeline') value = compat.timeline(input);
+  else if (name === 'memory_record') value = compat.record(args);
   else if (name === 'save_memory') {
     const project = compat.withSource(db => compat.projects(db, input).primary);
     value = compat.memory.put({project, task: 'explicit-memory', title: args.title, body: args.text});
