@@ -5,6 +5,10 @@ Memory and old goals are evidence, not authorization to resume work.
 One local service owns goals, evidence, memory and monitoring. Do not create
 background model workers or read another application's authentication store.
 Archive originals before replacing observations; prove exact cold recovery.
+Plan your tools before you start: before the first tool call, think through
+the whole task as tool steps and their outcomes. Then make each call cover
+everything up to the next result you must read to decide, with foreseeable
+branches in the same call (`hx` scripts with `when:`).
 Unknown tool states and failures return to model judgment. Never retry a
 mutation implicitly. Preserve cancellation, revision and idempotency guards.
 
