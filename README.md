@@ -1,8 +1,16 @@
-# HELIX 1.0 — Claude
+<p align="center">
+  <img src="docs/assets/helix-engine-banner.svg" alt="HELIX Engine — less replay, exact evidence, more useful work" width="100%">
+</p>
 
-<img src="docs/assets/helix-mark.svg" width="48" height="48" alt="HELIX double-strand logo">
+# HELIX Engine — Claude Edition
 
-[Buy me a coffee](https://buymeacoffee.com/superhelix7)
+**Make the model think about the problem. Not the same tool output for the twentieth time.**
+
+<p align="center">
+  <a href="https://buymeacoffee.com/superhelix7">
+    <img src="https://img.shields.io/badge/BUY%20ME%20A%20COFFEE-SUPPORT%20HELIX-F5C542?style=for-the-badge&logo=buymeacoffee&logoColor=172027&labelColor=172027" alt="Buy me a coffee — support HELIX">
+  </a>
+</p>
 
 HELIX 1.0 — Claude is the Claude Code edition of the HELIX engine. It keeps the HELIX ideas: exact originals stay out of repeated context, compact evidence is returned in their place, and mechanical steps run without asking a model to decide them again. On top of those it adds a toolchain for Claude Code agents and a rebuilt desktop app that shows what every model is doing and what it costs. It does not lower reasoning effort, force terse thinking, or promise unchanged task quality, and the evidence below includes where it lost.
 
