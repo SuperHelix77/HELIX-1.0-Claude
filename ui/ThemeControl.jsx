@@ -15,8 +15,10 @@ export default function ThemeControl() {
     apply();
     try { localStorage.setItem(storageKey, theme); } catch { /* Theme still works if storage is unavailable. */ }
     media.addEventListener('change', apply);
+    window.dispatchEvent(new CustomEvent('helix-theme', {detail: theme}));
     return () => media.removeEventListener('change', apply);
   }, [theme]);
+  useEffect(() => { const sync = event => setTheme(previous => previous === event.detail ? previous : event.detail); window.addEventListener('helix-theme', sync); return () => window.removeEventListener('helix-theme', sync); }, []);
   function navigate(event) {
     const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
     if (!keys.includes(event.key)) return;

@@ -5,21 +5,15 @@
   background: var(--canvas);
   font-synthesis: none;
   font-weight: 400;
-  --text: #111d1a;
-  --muted: #536760;
-  --bg: #f0faf7;
-  --surface: #e6f0ed;
+  --muted: var(--text-2);
   --primary: #1c8370;
   --primary-dark: #146957;
   --accent: #7c63b3;
-  --border: #d5e0dd;
   --white: #fff;
-  --canvas: #ffffff;
+  --canvas: var(--bg);
   --button-hover: #146957;
   --red: #a13636;
   --red-bg: #fff0ee;
-  --font-body: 'IBM Plex Sans', sans-serif;
-  --font-data: ui-monospace, SFMono-Regular, Consolas, monospace;
   --failure-count-bg: #f6e2dd;
   --neutral-bg: #f0f3f2;
   --neutral-text: #43564f;
@@ -50,22 +44,13 @@
 }
 :root {
   color-scheme: light;
-  --bg: #f3f4f1;
-  --surface: #e9eeea;
-  --border: #dce1dc;
 }
 :root[data-theme='dark'] {
   color-scheme: dark;
-  --text: #e6f6f1;
-  --muted: #a6b7af;
-  --bg: #141718;
-  --canvas: #191b1c;
-  --surface: #242829;
   --primary: #1c8370;
   --primary-dark: #83d0b5;
   --button-hover: #146957;
   --accent: #a68ee1;
-  --border: #3b4441;
   --red: #ffaaa5;
   --red-bg: #422626;
   --failure-count-bg: #422626;
@@ -110,7 +95,7 @@
   gap: 2px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--bg);
+  background: var(--bg-subtle);
 }
 .theme-control button {
   width: 27px;
@@ -309,7 +294,7 @@ button:disabled {
   opacity: .45;
 }
 button:not(:disabled):active {
-  background-color: var(--surface);
+  background-color: var(--surface-2);
 }
 .primary-button:not(:disabled):active {
   background-color: var(--button-hover);
@@ -394,7 +379,7 @@ strong {
   position: fixed;
   inset: 0 auto 0 0;
   width: 208px;
-  background: var(--bg);
+  background: var(--bg-subtle);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -658,7 +643,7 @@ main {
 }
 .status-ring.connected {
   color: var(--primary-dark);
-  background: var(--bg);
+  background: var(--bg-subtle);
   border-color: var(--connection-border);
 }
 .notice {
@@ -821,7 +806,7 @@ main {
 }
 .graph-node.in-use {
   border-color: var(--primary);
-  background: var(--bg);
+  background: var(--bg-subtle);
 }
 .graph-node.in-use .node-icon {
   color: var(--primary-dark);
@@ -1005,7 +990,7 @@ main {
 .request-status {
   height: 32px;
   width: 32px;
-  background: var(--bg);
+  background: var(--bg-subtle);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   display: grid;
@@ -1482,7 +1467,7 @@ tbody th {
 }
 @media(hover:hover) and (pointer:fine) {
   .icon-button:not(:disabled):hover {
-    background: var(--surface);
+    background: var(--surface-2);
     border-color: var(--border);
   }
   .sidebar nav a:hover {
@@ -1498,7 +1483,7 @@ tbody th {
     border-color: var(--primary-dark);
   }
   .secondary-button:not(:disabled):hover {
-    background: var(--bg);
+    background: var(--bg-subtle);
   }
   .primary-button:not(:disabled):hover {
     background: var(--button-hover);

@@ -1,4 +1,4 @@
-const {app, BrowserWindow, ipcMain, dialog} = require('electron');
+const {app, BrowserWindow, ipcMain, dialog, clipboard, shell} = require('electron');
 const path = require('node:path');
 const {pathToFileURL} = require('node:url');
 const fs = require('node:fs');
@@ -61,6 +61,41 @@ else app.whenReady().then(async () => {
     const result = await dialog.showOpenDialog(window, {properties: ['openFile'], title: 'Connect Claude-Mem read-only', filters: [{name: 'SQLite database', extensions: ['db', 'sqlite', 'sqlite3']}]});
     if (result.canceled) return null;
     return request('/memory/connect', {value: {file: result.filePaths[0]}});
+  });
+  ipcMain.handle('helix:live', event => { trusted(event); return request('/live'); });
+  ipcMain.handle('helix:live-session', (event, id) => {
+    trusted(event);
+    if (typeof id !== 'string' || !/^[a-f0-9]{16}$/.test(id)) throw new Error('Invalid session key');
+    return request(`/live/session?id=${id}`);
+  });
+  ipcMain.handle('helix:usage', (event, args = {}) => {
+    trusted(event);
+    const {range = '7d', group = 'model', ...rest} = args || {};
+    if (Object.keys(rest).length || !['5h', 'today', '7d', '30d'].includes(range) || !['model', 'session', 'project', 'family'].includes(group)) throw new Error('Invalid usage query');
+    return request(`/usage?range=${range}&group=${group}`);
+  });
+  for (const name of ['limits', 'runs', 'catalog', 'settings']) ipcMain.handle(`helix:${name}`, event => { trusted(event); return request(`/${name}`); });
+  ipcMain.handle('helix:save-settings', (event, patch) => {
+    trusted(event);
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid settings');
+    return request('/settings', {value: patch});
+  });
+  ipcMain.handle('helix:copy', (event, text) => {
+    trusted(event);
+    if (typeof text !== 'string' || text.length > 4096) throw new Error('Invalid clipboard text');
+    clipboard.writeText(text); return true;
+  });
+  ipcMain.handle('helix:share-snapshot', async event => {
+    trusted(event);
+    const info = connection.endpoint(home);
+    const response = await fetch(`${info.url}/snapshot.html`, {headers: {authorization: `Bearer ${info.token}`}, signal: AbortSignal.timeout(5000)});
+    if (!response.ok) throw new Error(`HELIX returned ${response.status}`);
+    const html = await response.text();
+    const pick = await dialog.showSaveDialog(window, {title: 'Save HELIX snapshot', defaultPath: path.join(app.getPath('downloads'), 'helix-snapshot.html'), filters: [{name: 'HTML', extensions: ['html']}]});
+    if (pick.canceled || !pick.filePath) return {saved: false};
+    fs.writeFileSync(pick.filePath, html, {mode: 0o600});
+    shell.showItemInFolder(pick.filePath);
+    return {saved: true};
   });
   ipcMain.handle('helix:diagnostics', event => { trusted(event); return request('/diagnostics'); });
   ipcMain.handle('helix:restart-core', event => { trusted(event); return request('/core/restart', {value: {}}); });

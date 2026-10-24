@@ -1,0 +1,48 @@
+/* HELIX design tokens (docs/design/HELIX-APP-DESIGN.md section 3) */
+:root {
+  /* type */
+  --font-body: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-data: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --fs-xs: 12px; --fs-sm: 13px; --fs-md: 14px; --fs-lg: 16px; --fs-xl: 20px; --fs-2xl: 28px;
+  --lh-tight: 1.2; --lh-body: 1.5;
+  --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600;
+  /* spacing (4px grid) */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
+  --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px; --radius-pill: 999px;
+  --rail-w: 224px; --topbar-h: 56px; --drawer-w: 480px;
+  /* neutrals (light) */
+  --bg: #ffffff; --bg-subtle: #f6f8f7; --surface: #ffffff; --surface-2: #f0f4f2;
+  --border: #dde4e1; --border-strong: #c2ccc8;
+  --text: #121a18; --text-2: #4d5d57; --text-3: #7d8c86;
+  /* brand + status */
+  --brand: #1c8370; --brand-strong: #146957; --focus: #1c8370;
+  --ok: #1f7a4d; --ok-bg: #e6f4ee; --warn: #9a6200; --warn-bg: #fff4dd;
+  --danger: #b33a3a; --danger-bg: #fdeceb; --info: #3b6fd1; --info-bg: #e9f0fd;
+  --demo: #62488e; --demo-bg: #f2eef9;
+  /* model identity: color + monogram, never color alone */
+  --m-opus: #c4552d;   --m-opus-bg: #fbeae3;    /* O  */
+  --m-sonnet: #3b6fd1; --m-sonnet-bg: #e9f0fd;  /* S  */
+  --m-haiku: #a87800;  --m-haiku-bg: #fbf2d9;   /* H  */
+  --m-codex: #4e5864;  --m-codex-bg: #eceff2;   /* Cx */
+  --m-other: #7d8c86;  --m-other-bg: #f0f4f2;   /* ?  dashed border */
+  /* meters */
+  --meter-track: #e6ece9; --meter-ok: var(--brand); --meter-warn: #d08a00; --meter-hot: #c43d3d;
+  --shadow-1: 0 1px 2px #121a1814; --shadow-2: 0 8px 24px #121a1824;
+  --dur-fast: 120ms; --dur-med: 200ms;
+}
+:root[data-theme='dark'] {
+  --bg: #121615; --bg-subtle: #171c1b; --surface: #1b211f; --surface-2: #222a27;
+  --border: #2c3532; --border-strong: #3d4945;
+  --text: #e9efec; --text-2: #a9b6b1; --text-3: #75837e;
+  --brand: #4cc2a6; --brand-strong: #6fd3bb; --focus: #6fd3bb;
+  --ok: #5cc98f; --ok-bg: #173226; --warn: #f0b54a; --warn-bg: #352a12;
+  --danger: #f07a7a; --danger-bg: #3a1c1c; --info: #8aaef5; --info-bg: #1b2a45;
+  --demo: #b9a3e3; --demo-bg: #2a2340;
+  --m-opus: #ee8e68;   --m-opus-bg: #3b2219;
+  --m-sonnet: #8aaef5; --m-sonnet-bg: #1b2a45;
+  --m-haiku: #e6bd4f;  --m-haiku-bg: #352a12;
+  --m-codex: #aab4bf;  --m-codex-bg: #262c32;
+  --m-other: #75837e;  --m-other-bg: #222a27;
+  --meter-track: #2c3532;
+}
+@media (prefers-reduced-motion: reduce) { :root { --dur-fast: 0ms; --dur-med: 0ms; } }

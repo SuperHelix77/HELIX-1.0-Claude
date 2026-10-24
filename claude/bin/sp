@@ -1,0 +1,5 @@
+#!/bin/sh
+# Print this Claude Code session's scratchpad directory (short alias for long paths).
+T=${HELIX_SCRATCH_ROOT:-$(cd /tmp && pwd -P)}   # physical tmp dir (symlink-resolved on macOS)
+for d in "$T"/claude-$(id -u)/*/"$CLAUDE_CODE_SESSION_ID"/scratchpad; do [ -d "$d" ] && { echo "$d"; exit 0; }; done
+exit 1

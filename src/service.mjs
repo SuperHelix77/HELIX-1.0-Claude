@@ -13,6 +13,15 @@ import {RtkAdapter} from './rtk-adapter.mjs';
 import {ModelState} from './model-state.mjs';
 import {MemoryCompatibility, callMemoryCompatibility, memoryCompatibilityTools} from './memory-compat.mjs';
 import {NativeCodexActivity, nativeActivityScope} from './native-codex-activity.mjs';
+import os from 'node:os';
+import {ClaudeUsageIndex} from './claude-usage-index.mjs';
+import {planLimits} from './plan-limits.mjs';
+import {runsView} from './runs-view.mjs';
+import {buildCatalog} from './catalog.mjs';
+import {engineActivity} from './engine-activity.mjs';
+import {redact, tildePath} from './redact.mjs';
+import {UiSettings} from './ui-settings.mjs';
+import {renderSnapshot} from './snapshot-html.mjs';
 
 const json = (res, status, value) => { res.writeHead(status, {'content-type': 'application/json', 'cache-control': 'no-store'}); res.end(JSON.stringify(value)); };
 async function body(req, limit = 1024 * 1024) {
@@ -23,7 +32,7 @@ async function body(req, limit = 1024 * 1024) {
 
 export async function createService({directory, port = 0, upstream = process.env.HELIX_OPENAI_BASE, fetchImpl, optimizerOptions,
   nativeActivityFactory = changed => new NativeCodexActivity({changed}),
-  coreFactory = (home, emit) => new CoreClient(home, emit)} = {}) {
+  coreFactory = (home, emit) => new CoreClient(home, emit), claudeHome = os.homedir(), now = () => Date.now()} = {}) {
   if (upstream) officialUpstream(upstream);
   directory = privateDirectory(directory);
   const lock = path.join(directory, 'service.lock');
@@ -41,6 +50,24 @@ export async function createService({directory, port = 0, upstream = process.env
     if (fs.existsSync(path.join(source, 'controller/final-results.json'))) return benchmarkView(source);
     if (source !== observerDirectory) { observerDirectory = source; observer = new BenchmarkObserver(source); }
     return observer.view();
+  }
+  const usageIndex = new ClaudeUsageIndex({home: claudeHome, now}), uiSettings = new UiSettings({directory, home: claudeHome});
+  let catalogCache = null, lastRefresh = 0;
+  const html = (res, text) => { res.writeHead(200, {'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'"}); res.end(text); };
+  function appData(range = '7d') {
+    const cfg = uiSettings.load(), ro = {home: claudeHome, fullPaths: cfg.privacy.show_full_paths};
+    const opts = {details: cfg.privacy.show_action_details, projects: cfg.privacy.show_project_names};
+    if (cfg.sources.claude && Date.now() - lastRefresh > 1000) { usageIndex.refresh(); lastRefresh = Date.now(); }
+    const emptyLive = {sessions: [], totals: {active_sessions: 0, cost_today_usd: 0}, stats: usageIndex.publicStats()};
+    const out = (v) => redact(v, ro);
+    const liveBody = () => {
+      const l = cfg.sources.claude ? usageIndex.live(opts) : emptyLive, e = cfg.sources.helix_logs ? engineActivity(claudeHome, {now: now()}) : {flows: [], shell: []};
+      return out({schema: 'helix.live.v1', generated_at: new Date(now()).toISOString(), totals: l.totals, sessions: l.sessions, engine: e, stats: l.stats});
+    };
+    const usageBody = (q) => out(cfg.sources.claude ? usageIndex.usage(q, opts) : {schema: 'helix.usage.v1', range: q.range, group: q.group, from: null, to: null, totals: {requests: 0}, series: [], rows: [], stats: usageIndex.publicStats()});
+    const limitsBody = () => out(cfg.sources.plan_limits ? planLimits({home: claudeHome, benchRoot: cfg.sources.bench_root, now: now()}) : {schema: 'helix.limits.v1', windows: {five_hour: {utilization: null, resets_at: null, observed_at: null, state: 'unknown', source: null}, seven_day: {utilization: null, resets_at: null, observed_at: null, state: 'unknown', source: null}}});
+    const runsBody = () => out(runsView(fs.existsSync(cfg.sources.bench_root) ? cfg.sources.bench_root : null, p => tildePath(p, claudeHome)));
+    return {cfg, opts, out, liveBody, usageBody, limitsBody, runsBody};
   }
   const counters = {operations: 0, failed: 0, model_calls: 0, memory_lookups: 0, rtk_filters: 0, known_input: 0, known_output: 0, unknown_usage: 0};
   const rtk = new RtkAdapter({directory});
@@ -215,6 +242,24 @@ export async function createService({directory, port = 0, upstream = process.env
         const heartbeat = setInterval(() => { if (!res.write(': heartbeat\n\n')) res.end(); }, 15000); heartbeat.unref();
         res.once('close', () => { clearInterval(heartbeat); modelSubscribers.delete(res); });
         return;
+      }
+      if (req.method === 'GET' && req.url.startsWith('/live') || req.method === 'GET' && /^\/(usage|limits|runs|catalog|settings|snapshot\.html)(?:\?|$)/.test(req.url) || req.method === 'POST' && req.url === '/settings') {
+        const url = new URL(req.url, 'http://127.0.0.1'), a = appData();
+        if (url.pathname === '/live' && req.method === 'GET') return json(res, 200, a.liveBody());
+        if (url.pathname === '/live/session') {
+          const id = url.searchParams.get('id') || '', v = /^[a-f0-9]{16}$/.test(id) && a.cfg.sources.claude ? usageIndex.liveSession(id, a.opts) : null;
+          return v ? json(res, 200, a.out(v)) : json(res, 404, {error: 'Session not found'});
+        }
+        if (url.pathname === '/usage') return json(res, 200, a.usageBody({range: url.searchParams.get('range') || '7d', group: url.searchParams.get('group') || 'model'}));
+        if (url.pathname === '/limits') return json(res, 200, a.limitsBody());
+        if (url.pathname === '/runs') return json(res, 200, a.runsBody());
+        if (url.pathname === '/catalog') {
+          if (!catalogCache || Date.now() - catalogCache.at > 60000) catalogCache = {at: Date.now(), value: buildCatalog(claudeHome)};
+          return json(res, 200, a.out(catalogCache.value));
+        }
+        if (url.pathname === '/settings' && req.method === 'GET') return json(res, 200, a.out(uiSettings.view(p => tildePath(p, claudeHome))));
+        if (url.pathname === '/settings' && req.method === 'POST') { uiSettings.save(await body(req, 16 * 1024)); return json(res, 200, a.out(uiSettings.view(p => tildePath(p, claudeHome)))); }
+        if (url.pathname === '/snapshot.html') return html(res, renderSnapshot({live: a.liveBody(), usage: a.usageBody({range: 'today', group: 'model'}), limits: a.limitsBody(), runs: a.runsBody(), generated: new Date(now()).toISOString()}));
       }
       if (req.method === 'GET' && req.url === '/diagnostics') return json(res, 200, diagnostics());
       if (req.method === 'GET' && req.url === '/memory/projects') {

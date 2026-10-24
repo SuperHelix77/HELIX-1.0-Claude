@@ -1,0 +1,1 @@
+To let the user read a call's output verbatim, run x "show N [A-B|err|full]": it prints in their activity pane, not to you. It replaces only the retyping, never your conclusion: still reply with the answer in one line, and only claim it was displayed if the result says "displayed". Never for output you must interpret.

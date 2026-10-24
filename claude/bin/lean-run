@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""lean-run [-m haiku|sonnet|opus] [-e low|medium|high|xhigh|max] [-d DIR] [-t TURNS] [-b USD] TASKFILE|-
+Run one task in a full Helix-lean Claude session (helix launcher). Prints the result text then one stats line:
+  [lean-run model=.. turns=.. cost_usd=.. stop=.. log=PATH]
+Full JSON goes to logs/lean-run-*.json (never into the caller's context). Exit 0 ok, 1 error/cap."""
+import sys, os, json, subprocess, time
+H = os.environ.get("HELIX_HOME") or os.environ.get("HELIX_LEAN_HOME") or os.path.expanduser("~/.claude-lean")
+a = sys.argv[1:]; o = dict(m="sonnet", e="medium", d=os.getcwd(), t="40", b="2"); src = None
+while a:
+    x = a.pop(0)
+    if x in ("-m", "-e", "-d", "-t", "-b"): o[x[1]] = a.pop(0)
+    else: src = x
+if src is None: sys.exit(__doc__)
+task = sys.stdin.read() if src == "-" else open(src).read()
+cmd = [os.path.join(H, "helix"), "--effort", o["e"], "-p", task, "--permission-mode", "bypassPermissions",
+       "--max-turns", o["t"], "--max-budget-usd", o["b"], "--output-format", "json", "--no-session-persistence"]
+p = subprocess.run(cmd, cwd=o["d"], stdin=subprocess.DEVNULL, capture_output=True, text=True, env={**os.environ, "CL_MODEL": o["m"]})
+res = None
+for ln in reversed(p.stdout.strip().split("\n")):
+    if ln.startswith("{"):
+        try: res = json.loads(ln); break
+        except Exception: pass
+os.makedirs(os.path.join(H, "logs"), exist_ok=True); log = os.path.join(H, "logs", f"lean-run-{int(time.time())}-{os.getpid()}.json")
+json.dump(res or {"raw": p.stdout[-2000:], "err": p.stderr[-1000:]}, open(log, "w"))
+if res is None: print("ERROR: no JSON result.", p.stderr[-400:]); sys.exit(1)
+st = res.get("subtype", "?"); print(res.get("result", "")); print(f"[lean-run model={o['m']} turns={res.get('num_turns')} cost_usd={res.get('total_cost_usd')} stop={st} log={log}]")
+sys.exit(0 if st == "success" and not res.get("is_error") else 1)

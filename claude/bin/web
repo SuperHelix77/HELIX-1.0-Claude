@@ -1,0 +1,50 @@
+#!/usr/bin/env node
+// web: zero-schema headless browser (Playwright), stands in for the denied built-in browser.
+// web URL [--w N] [--h N] [--mobile] [--dark] [--wait SEL|MS] [--click SEL] [--fill SEL=TEXT]
+//         [--press KEY] [--js EXPR] [--text [N]] [--shot FILE] [--full]   (actions run in order)
+const path = require("node:path"), { createRequire } = require("node:module"), { execSync } = require("node:child_process");
+function loadPw() {
+  const roots = [process.env.WEB_PW_ROOT, process.cwd(), process.env.HELIX_ENGINE || path.resolve(__dirname, "..", "..")];
+  try { roots.push(path.dirname(execSync("npm root -g", { encoding: "utf8" }).trim())); } catch {}
+  for (const r of roots.filter(Boolean)) { try { return createRequire(path.join(r, "x.js"))("playwright"); } catch {} }
+  console.error("web: playwright not found (set WEB_PW_ROOT to a folder with node_modules/playwright)"); process.exit(2);
+}
+const a = process.argv.slice(2), url = a.shift();
+if (!url || url.startsWith("--")) { console.error("usage: web URL [--w N] [--h N] [--mobile] [--dark] [--wait SEL|MS] [--click SEL] [--fill SEL=TEXT] [--press KEY] [--js EXPR] [--text [N]] [--shot FILE] [--full]"); process.exit(2); }
+const opt = (k) => { const i = a.indexOf(k); return i < 0 ? undefined : a[i + 1]; };
+(async () => {
+  const { chromium } = loadPw();
+  const mobile = a.includes("--mobile");
+  let browser;
+  for (const o of [{}, { channel: "chrome" }, { executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }]) {
+    try { browser = await chromium.launch(o); break; } catch (e) { if (!o.executablePath) continue; console.error(`web: no browser (${e.message.split("\n")[0]})`); process.exit(2); }
+  }
+  const ctx = await browser.newContext({
+    viewport: { width: Number(opt("--w") || (mobile ? 375 : 1280)), height: Number(opt("--h") || (mobile ? 812 : 800)) },
+    isMobile: mobile, hasTouch: mobile, colorScheme: a.includes("--dark") ? "dark" : "light",
+  });
+  const page = await ctx.newPage(), logs = [];
+  page.on("console", (m) => { if (["error", "warning"].includes(m.type())) logs.push(`console.${m.type()}: ${m.text()}`); });
+  page.on("pageerror", (e) => logs.push(`pageerror: ${e.message}`));
+  let code = 0;
+  try {
+    const r = await page.goto(url, { waitUntil: "load", timeout: 30000 });
+    console.log(`${r ? r.status() : "-"} ${JSON.stringify(await page.title())} ${page.url()}`);
+    for (let i = 0; i < a.length; i++) {
+      const k = a[i], v = a[i + 1];
+      if (k === "--wait") { /^\d+$/.test(v) ? await page.waitForTimeout(Number(v)) : await page.waitForSelector(v, { timeout: 10000 }); i++; }
+      else if (k === "--click") { await page.click(v, { timeout: 10000 }); console.log(`clicked ${v}`); i++; }
+      else if (k === "--fill") { const j = v.indexOf("="); await page.fill(v.slice(0, j), v.slice(j + 1)); console.log(`filled ${v.slice(0, j)}`); i++; }
+      else if (k === "--press") { await page.keyboard.press(v); i++; }
+      else if (k === "--js") { console.log("js:", JSON.stringify(await page.evaluate(v)).slice(0, 2000)); i++; }
+      else if (k === "--text") {
+        const n = /^\d+$/.test(v || "") ? (i++, Number(v)) : 3000;
+        const t = await page.evaluate(() => (document.querySelector("main,article") || document.body).innerText);
+        console.log("text:", t.length > n ? t.slice(0, n) + ` …[+${t.length - n} chars]` : t);
+      } else if (k === "--shot") { await page.screenshot({ path: v, fullPage: a.includes("--full") }); console.log(`shot ${v}`); i++; }
+      else if (["--w", "--h"].includes(k)) i++;
+    }
+  } catch (e) { console.log(`error: ${e.message.split("\n")[0]}`); code = 1; }
+  if (logs.length) console.log(logs.slice(0, 15).join("\n") + (logs.length > 15 ? `\n…[+${logs.length - 15} console lines]` : ""));
+  await browser.close(); process.exit(code);
+})();

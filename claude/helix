@@ -1,0 +1,69 @@
+#!/bin/zsh
+# Helix Engine launcher. Lean frontier session + local semantic runtime.
+#   helix [--profile lean95u|int|lean] [--terse concise|ultra|full|lite|off] [--handle] [--show] [claude args...]
+#   lean95u only: --mcp (or HELIX_MCP=1) adds helix goal/memory/context tools (costs prompt tokens);
+#     --allow-bash (or HELIX_ALLOW_BASH=1) pre-approves every Bash call: the agent runs any shell command as you, unprompted.
+#     Without it, read-only commands (ls, cat, head, tail, wc, grep, rg, pwd, git status/diff/log/show) are pre-approved.
+#   helix --watch   open the live activity pane automatically (tmux split or Terminal window)
+#   helix watch [-m quiet|standard|verbose]  (live human-side activity of the newest session; free, never enters model context)
+#   helix doctor [--live] | helix prompt | helix version | helix lm-up | helix lm-down
+#   helix preflight "goal" | helix graph run G.json [--root D] | helix hooks (prints settings snippet; never writes) | helix consolidate TRANSCRIPT SESSION
+H=${HELIX_HOME:-${HELIX_LEAN_HOME:-$HOME/.claude-lean}}; export HELIX_HOME=$H
+case "$1" in
+  watch) shift; exec python3 $H/bin/hactivity -f "$@";;
+  doctor) shift; exec /usr/bin/env python3 $H/helix_doctor.py "$@";;
+  prompt) shift; exec python3 $H/compose.py "$@";;
+  version) cat $H/VERSION; exit 0;;
+  preflight) shift; exec python3 $H/adapters/standalone.py preflight "$@";;
+  graph) shift; exec python3 $H/adapters/standalone.py "$@";;
+  hooks) exec python3 $H/adapters/claude_code.py --print-settings;;
+  consolidate) shift; exec python3 -c "import sys,os;sys.path.insert(0,'$H/lib');import consolidate,json;print(json.dumps(consolidate.consolidate(sys.argv[1],sys.argv[2],db=os.environ.get('HELIX_MEM_DB',os.path.join('$H','memory.db')),root='.')))" "$@";;
+  lm-up) exec $H/lmup.sh;;
+  lm-down) exec $H/lmdown.sh;;
+esac
+PROFILE=${HELIX_PROFILE:-lean95u}; WATCH=${HELIX_WATCH:-0}; HANDLE=0; SHOW=${HELIX_SHOW:-0}; ARGS_IN=(); TERSE=${HELIX_TERSE:-}
+MCP=${HELIX_MCP:-0}; ALLOW_BASH=${HELIX_ALLOW_BASH:-0}
+while (( $# )); do case "$1" in --mcp) MCP=1; shift;; --allow-bash) ALLOW_BASH=1; shift;; --terse) TERSE=$2; shift 2;; --handle) HANDLE=1; shift;; --profile) PROFILE=$2; shift 2;; --watch) WATCH=1; shift;; --show) SHOW=1; shift;; *) ARGS_IN+=("$1"); shift;; esac; done
+[[ -n "$CL_HANDLE" ]] && HANDLE=1
+[[ $WATCH == 1 ]] && SHOW=1   # the pane is where `show` output lands
+# profiles: lean95u (default, field test) = Bash-only tool, prompt.d/lean95u.txt, opus high effort, no MCP/compose; int = full reasoning, concise replies, 10k output, adaptive tool budget, sonnet subagents; lean = max compression (ultra, 4k out, haiku subagents)
+if [[ $PROFILE == lean ]]; then SET=$H/settings.json; : ${TERSE:=ultra}; SHCAP=5000; SHEXP=5000; else SET=$H/settings.int.json; : ${TERSE:=concise}; SHCAP=${X_SHCAP:-4000}; SHEXP=${X_SHEXP:-12000}; fi
+PRINT=0; [[ " ${ARGS_IN[*]} " == *" -p "* || " ${ARGS_IN[*]} " == *" --print "* ]] && PRINT=1
+[[ $HANDLE == 1 && $PRINT == 0 ]] && HANDLE=0   # @N expansion needs print mode
+[[ -n "$HELIX_LOCAL" ]] && $H/lmup.sh   # local LM is opt-in (universal-only policy)
+RD=$H/run/$$; mkdir -p $RD
+export CL_ACT_LOG=$H/logs/activity-$$.jsonl   # shared by the MCP server (writer), the statusLine (hstatus) and `helix watch`
+mkdir -p $H/logs; : > $CL_ACT_LOG
+if [[ $WATCH == 1 && $PRINT == 0 ]]; then   # opt-in live pane: tmux split if inside tmux, else a Terminal.app window (macOS)
+  if [[ -n "$TMUX" ]]; then tmux split-window -d -h "python3 $H/bin/hactivity $CL_ACT_LOG -f"
+  else osascript -e "tell application \"Terminal\" to do script \"python3 $H/bin/hactivity $CL_ACT_LOG -f\"" >/dev/null 2>&1; fi
+fi
+if [[ $PROFILE == lean95u ]]; then   # benchmark-proven lane: one Bash tool, dense calls, separate verification pass
+  CFG=
+  ARGS=(--setting-sources project --settings "$SET" --strict-mcp-config --tools Bash
+    --system-prompt "$(cat $H/prompt.d/lean95u.txt)" --model "${CL_MODEL:-opus}"
+    --exclude-dynamic-system-prompt-sections --disable-slash-commands)
+  [[ " ${ARGS_IN[*]} " == *" --effort "* ]] || ARGS+=(--effort high)
+  if [[ $ALLOW_BASH == 1 ]]; then ALLOW=(Bash)
+  else ALLOW=('Bash(ls:*)' 'Bash(cat:*)' 'Bash(head:*)' 'Bash(tail:*)' 'Bash(wc:*)' 'Bash(grep:*)' 'Bash(rg:*)' 'Bash(pwd)'
+    'Bash(git status:*)' 'Bash(git diff:*)' 'Bash(git log:*)' 'Bash(git show:*)'); fi
+  if [[ $MCP == 1 ]]; then   # helix engine MCP: goal/memory/context; state in HELIX_MCP_HOME, never ~/.helix
+    CFG=$(mktemp /tmp/.helix_mcp.XXXXXX)
+    print -r -- "{\"mcpServers\":{\"helix\":{\"type\":\"stdio\",\"command\":\"node\",\"args\":[\"${HELIX_ENGINE:-${0:A:h:h}}/bin/helix.mjs\",\"mcp\"],\"env\":{\"HELIX_HOME\":\"${HELIX_MCP_HOME:-$HOME/.helix-claude}\"}}}}" > $CFG
+    ARGS+=(--mcp-config "$CFG"); ALLOW+=(mcp__helix)
+  fi
+  ARGS+=("--allowedTools=${(j:,:)ALLOW}")   # one arg: variadic form would swallow a positional prompt
+  HANDLE=0
+else
+CFG=$(mktemp /tmp/.helix_mcp.XXXXXX)
+cat > $CFG <<J
+{"mcpServers":{"s":{"command":"/usr/bin/python3","args":["$H/sh_mcp.py"],"env":{"CL_RUN_DIR":"$RD","HELIX_HOME":"$H","SH_CAP":"$SHCAP","SH_CAP_EXP":"$SHEXP","CL_ACT_LOG":"$CL_ACT_LOG"}}}}
+J
+PROMPT=$(python3 $H/compose.py --terse $TERSE $([[ $HANDLE == 1 ]] && echo --handle) $([[ $SHOW == 1 && $PRINT == 0 ]] && echo --show))
+ARGS=(--setting-sources project --settings "$SET" --strict-mcp-config
+  --mcp-config "$CFG" --tools "" --system-prompt "$PROMPT" --model "${CL_MODEL:-sonnet}"
+  --exclude-dynamic-system-prompt-sections)
+fi
+if [[ $HANDLE == 1 ]]; then claude "${ARGS[@]}" "${ARGS_IN[@]}" | python3 $H/expand.py $RD
+else claude "${ARGS[@]}" "${ARGS_IN[@]}"; fi
+rc=$?; [[ -n $CFG ]] && rm -f $CFG; rm -rf $RD; exit $rc

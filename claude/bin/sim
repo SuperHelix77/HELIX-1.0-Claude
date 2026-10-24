@@ -1,0 +1,16 @@
+#!/bin/bash
+# sim: zero-schema iOS Simulator helper over xcrun simctl, stands in for the denied simulator tool.
+# Taps/swipes need idb or the real tool (toolgate allow mcp__Claude_Code_iOS_Simulator).
+xcrun -f simctl >/dev/null 2>&1 || { echo "sim: simctl unavailable (install Xcode, then sudo xcode-select -s /Applications/Xcode.app)"; exit 2; }
+dev=${SIM_DEVICE:-booted}; cmd=$1; shift
+case $cmd in
+  list) xcrun simctl list devices available | grep -E 'iPhone|iPad|Booted' | head -20 ;;
+  boot) xcrun simctl boot "$1" 2>/dev/null; open -a Simulator; xcrun simctl bootstatus "$1" -b | tail -1 ;;
+  install) xcrun simctl install "$dev" "$1" ;;
+  launch) xcrun simctl launch "$dev" "$1" ;;
+  url) xcrun simctl openurl "$dev" "$1" ;;
+  shot) out=${1:-$(${HELIX_LEAN_HOME:-$HOME/.claude-lean}/bin/sp)/sim.png}; xcrun simctl io "$dev" screenshot "$out" >/dev/null && sips -Z "${2:-1000}" "$out" >/dev/null && echo "$out" ;;
+  appearance) xcrun simctl ui "$dev" appearance "$1" ;;
+  log) xcrun simctl spawn "$dev" log show --last "${1:-1m}" --style compact | tail -"${2:-40}" ;;
+  *) echo "usage: sim list|boot NAME|install APP|launch BUNDLE|url URL|shot [FILE] [PX]|appearance light|dark|log [1m] [N]  (SIM_DEVICE=udid, default booted)"; exit 2 ;;
+esac

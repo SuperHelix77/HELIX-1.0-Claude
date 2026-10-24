@@ -1,0 +1,15 @@
+#!/bin/bash
+# toolgate: show, allow or block a denied tool in ./.claude/settings.local.json (project-local deny list).
+# Allowing adds the tool's schema back to every request; block it again when done.
+f=.claude/settings.local.json; act=$1; name=$2
+[ -f "$f" ] || { echo "toolgate: no $f here"; exit 2; }
+python3 - "$f" "$act" "$name" <<'PY'
+import json, sys
+f, act, name = sys.argv[1:4]
+d = json.load(open(f)); deny = d.setdefault("permissions", {}).setdefault("deny", [])
+if act == "allow" and name in deny: deny.remove(name)
+elif act == "block" and name and name not in deny: deny.append(name)
+elif act not in ("list", "allow", "block"): sys.exit("usage: toolgate list|allow NAME|block NAME")
+json.dump(d, open(f, "w"), indent=2)
+print("denied:", ", ".join(deny) or "none")
+PY

@@ -1,35 +1,43 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
-import {Activity, ArrowDown, ArrowRight, ArrowUpRight, BookOpen, Brain, Check, CheckCircle2, ChevronRight, Circle, CircleAlert, Clock3, Database, FileCheck2, FolderOpen, GitBranch, Layers3, LayoutDashboard, LockKeyhole, Menu, Pause, Play, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Wrench, Workflow, X} from 'lucide-react';
+import {Activity, ArrowDown, ArrowRight, ArrowUpRight, BookOpen, Brain, Check, CheckCircle2, ChevronRight, Circle, CircleAlert, Clock3, Database, FileCheck2, FlaskConical, FolderOpen, GitBranch, Layers3, LayoutDashboard, LockKeyhole, Menu, Pause, Play, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Sparkles, Workflow, Wrench, X} from 'lucide-react';
 import '@fontsource/ibm-plex-sans/400.css';
 import '@fontsource/ibm-plex-sans/500.css';
 import '@fontsource/ibm-plex-sans/600.css';
+import './tokens.css';
 import './styles.css';
+import './shell.css';
 import {playback} from './playback.mjs';
 import ThemeControl from './ThemeControl.jsx';
 import BenchmarkMonitor from './BenchmarkMonitor.jsx';
 import helixMark from '../docs/assets/helix-mark.svg';
+import {AppContext, usePoll, expectSchema} from './hooks.js';
+import PlanStrip from './components/PlanStrip.jsx';
+import {Rail, TabBar} from './components/Rail.jsx';
+import {EmptyState} from './components/States.jsx';
+import LiveScreen from './screens/Live.jsx';
+import UsageScreen from './screens/Usage.jsx';
+import RunsScreen from './screens/Runs.jsx';
+import SkillsScreen from './screens/Skills.jsx';
+import SettingsScreen from './screens/Settings.jsx';
+import {liveFixture, liveSessionFixture} from './fixtures/live.mjs';
+import {usageFixture} from './fixtures/usage.mjs';
+import {limitsFixture} from './fixtures/limits.mjs';
+import {runsFixture} from './fixtures/runs.mjs';
+import {catalogFixture} from './fixtures/catalog.mjs';
+import {settingsFixture, memoryDemo} from './fixtures/settings.mjs';
 
 const demo = new URLSearchParams(location.search).get('demo') === '1';
 const developmentMonitor = import.meta.env.MODE === 'monitor';
-const sections = [
-  ['overview', 'Overview', LayoutDashboard], ['flow', 'Flow', GitBranch],
-  ['evidence', 'Evidence', FileCheck2], ['memory', 'Memory', Database],
-  ['troubleshooting', 'Troubleshooting', Wrench],
-  ...(developmentMonitor ? [['benchmarks', 'Benchmarks', SlidersHorizontal]] : []),
-];
 const number = value => value == null ? 'Not reported' : new Intl.NumberFormat().format(value);
 const time = value => value == null || !Number.isFinite(new Date(value).getTime()) ? 'Not reported' : new Intl.DateTimeFormat(undefined, {hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}).format(new Date(value));
 const readable = value => value == null ? 'Not reported' : String(value).replaceAll('_', ' ');
-const sectionFromHash = () => sections.some(([id]) => id === location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
-
-function useSnapshot() {
+function useSnapshot(active, paused, tick) {
   const [snapshot, setSnapshot] = useState(null);
   const [state, setState] = useState('loading');
-  const [paused, setPaused] = useState(false);
-  const [refresh, setRefresh] = useState(0);
   const [received, setReceived] = useState(null);
   useEffect(() => {
+    if (!active) return undefined;
     let disposed = false, timer;
     async function poll() {
       try {
@@ -42,12 +50,12 @@ function useSnapshot() {
     }
     poll();
     return () => { disposed = true; clearTimeout(timer); };
-  }, [paused, refresh]);
+  }, [active, paused, tick]);
   useEffect(() => {
-    if (demo || paused || typeof window.helix?.onModelState !== 'function') return;
+    if (!active || demo || paused || typeof window.helix?.onModelState !== 'function') return;
     return window.helix.onModelState(model => setSnapshot(previous => previous ? {...previous, model_state: model} : previous));
-  }, [paused]);
-  return {snapshot, state, paused, setPaused, received, refresh: () => setRefresh(n => n + 1)};
+  }, [active, paused]);
+  return {snapshot, state, received};
 }
 
 function IconButton({label, children, ...props}) {
@@ -173,11 +181,13 @@ function Memory({snapshot, inspect}) {
   const [project, setProject] = useState(''), [query, setQuery] = useState(''), [result, setResult] = useState(null), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [projects, setProjects] = useState([]), [source, setSource] = useState('helix'), [notes, setNotes] = useState(null), [reading, setReading] = useState(null), [nextCursor, setNextCursor] = useState(null);
   const revision = useRef(0);
-  const supported = !demo && typeof window.helix?.memorySearch === 'function';
-  const browsable = !demo && typeof window.helix?.memoryBrowse === 'function';
+  const mem = demo ? memoryDemo : window.helix;
+  const supported = typeof mem?.memorySearch === 'function';
+  const browsable = typeof mem?.memoryBrowse === 'function';
   useEffect(() => {
     let current = true;
-    if (!demo && window.helix?.memoryProjects) window.helix.memoryProjects().then(value => { if (current) setProjects(Array.isArray(value) ? value : []); }).catch(() => { if (current) setError('Project list unavailable. Enter a project to continue.'); });
+    if (mem?.memoryProjects) mem.memoryProjects().then(value => { if (current) setProjects(Array.isArray(value) ? value : []); }).catch(() => { if (current) setError('Project list unavailable. Enter a project to continue.'); });
+    if (demo) mem.memoryBrowse({}).then(r => { if (current) { setProject('helix-demo'); setNotes(r.notes); } });
     return () => { current = false; revision.current++; };
   }, []);
   function changeScope(change) {
@@ -188,7 +198,7 @@ function Memory({snapshot, inspect}) {
     const request = ++revision.current;
     setBusy(true); setError(''); setResult(null); if (cursor === null) { setNotes(null); setNextCursor(null); } setReading(null);
     try {
-      const response = decodeMemory(await (browse ? window.helix.memoryBrowse({project: project.trim(), source, limit: 20, ...(cursor === null ? {} : {cursor})}) : window.helix.memorySearch({project: project.trim(), query: query.trim(), source, limit: 20})));
+      const response = decodeMemory(await (browse ? mem.memoryBrowse({project: project.trim(), source, limit: 20, ...(cursor === null ? {} : {cursor})}) : mem.memorySearch({project: project.trim(), query: query.trim(), source, limit: 20})));
       if (request !== revision.current) return;
       const items = Array.isArray(response) ? response : response?.notes || response?.results;
       if (Array.isArray(items)) { setNotes(previous => cursor === null ? items : [...(previous || []), ...items]); setNextCursor(browse ? response?.next_cursor ?? null : null); }
@@ -200,7 +210,7 @@ function Memory({snapshot, inspect}) {
     const request = ++revision.current;
     setReading(note.id); setError('');
     try {
-      const value = decodeMemory(await window.helix.memoryRead({id: note.id, project: project.trim(), source: note.source || source}));
+      const value = decodeMemory(await mem.memoryRead({id: note.id, project: project.trim(), source: note.source || source}));
       if (request === revision.current) inspect({title: value?.title || note.title || 'Exact memory note', fields: {ID: value?.id ?? note.id, Project: value?.project || project, Source: value?.source || note.source || source, Task: value?.task, Kind: value?.kind, Created: time(value?.created)}, literal: typeof value === 'string' ? value : typeof value?.body === 'string' ? value.body : JSON.stringify(value, null, 2), note: 'Exact stored content. Retrieval does not start or resume work.'});
     } catch { if (request === revision.current) setError('The exact note could not be read. Try again.'); }
     finally { if (request === revision.current) setReading(null); }
@@ -213,15 +223,15 @@ function Memory({snapshot, inspect}) {
       if (request !== revision.current || status == null) return;
       setResult(typeof status === 'string' ? status : status.message || status.status || JSON.stringify(status, null, 2));
       setSource('claude-mem'); setProject('');
-      const list = await window.helix.memoryProjects();
+      const list = await mem.memoryProjects();
       if (request === revision.current) setProjects(Array.isArray(list) ? list : []);
     } catch { if (request === revision.current) setError('Claude-Mem could not connect. Choose an accessible memory database and try again.'); }
     finally { if (request === revision.current) setBusy(false); }
   }
   return <><section className="memory-summary"><Heading title="Deterministic memory" aside={<div className="memory-heading-actions"><Badge>{readable(snapshot.memory?.status)}</Badge><button className="secondary-button" onClick={connectClaudeMem} disabled={demo || busy || reading !== null || typeof window.helix?.connectClaudeMem !== 'function'}><FolderOpen size={16} />Connect Claude-Mem</button></div>} /><div className="memory-count"><Database size={28} /><strong>{number(snapshot.memory?.notes)}</strong><span>stored notes</span></div>
     <form className="memory-form" onSubmit={retrieve}><label>Source<select aria-label="Memory source" value={source} onChange={e => changeScope(() => setSource(e.target.value))} disabled={(!supported && !browsable) || busy || reading !== null}><option value="helix">HELIX</option><option value="claude-mem">Claude-Mem</option></select></label><label>Project<input name="project" autoComplete="off" list="memory-projects" value={project} onChange={e => changeScope(() => setProject(e.target.value))} placeholder="Project identifier" required disabled={(!supported && !browsable) || busy || reading !== null} /></label><datalist id="memory-projects">{projects.filter(item => item.source === source).map(item => <option key={`${item.source}:${item.project}`} value={item.project}>{number(item.notes)} notes</option>)}</datalist><label>Query<input name="query" autoComplete="off" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search stored notes" disabled={!supported || busy} /></label><div className="memory-actions"><button type="button" className="secondary-button" onClick={() => retrieve(null, true)} disabled={!browsable || busy || reading !== null || !project.trim()}><FolderOpen size={16} />Browse notes</button><button className="primary-button" disabled={!supported || busy || reading !== null || !project.trim() || !query.trim()}><Search size={16} />{busy ? 'Loading...' : 'Search memory'}</button></div></form>
-    {!supported && <p className="muted small">{demo ? 'Memory search is unavailable in playback.' : 'Memory search is unavailable in this connection.'}</p>}
-    {error && <p className="error-text" role="alert">{error}</p>}<div aria-live="polite">{busy && <p className="muted memory-progress">Retrieving stored notes...</p>}{notes !== null && <><div className="memory-results-heading"><strong>{number(notes.length)} notes returned</strong><span className="muted">{source === 'helix' ? 'HELIX' : 'Claude-Mem'} / {project}</span></div>{notes.length ? <div className="memory-note-list">{notes.map(note => <button className="memory-note" key={`${note.source || source}:${note.id}`} disabled={busy || reading !== null || typeof window.helix?.memoryRead !== 'function'} onClick={() => read(note)}><BookOpen size={18} /><div><strong>{note.title || note.task || `Note ${note.id}`}</strong><p>{note.preview || note.body || note.kind || 'No preview available'}</p><small className="muted">{note.source || source} / {time(note.created)}</small></div><span>{reading === note.id ? 'Reading...' : <ArrowUpRight size={17} />}</span></button>)}</div> : <Empty icon={Search} title="No matching notes" />}{nextCursor !== null && <button className="secondary-button memory-load-more" disabled={busy || reading !== null} onClick={() => retrieve(null, true, nextCursor)}><ArrowDown size={16} />Load more notes</button>}</>}{result !== null && <pre className="literal-result">{result}</pre>}</div>
+    {!supported && <p className="muted small">Memory search is unavailable in this connection.</p>}
+    {error && <p className="error-text" role="alert">{error}</p>}<div aria-live="polite">{busy && <p className="muted memory-progress">Retrieving stored notes...</p>}{notes !== null && <><div className="memory-results-heading"><strong>{number(notes.length)} notes returned</strong><span className="muted">{source === 'helix' ? 'HELIX' : 'Claude-Mem'} / {project}</span></div>{notes.length ? <div className="memory-note-list">{notes.map(note => <button className="memory-note" key={`${note.source || source}:${note.id}`} disabled={busy || reading !== null || typeof mem?.memoryRead !== 'function'} onClick={() => read(note)}><BookOpen size={18} /><div><strong>{note.title || note.task || `Note ${note.id}`}</strong><p>{note.preview || note.body || note.kind || 'No preview available'}</p><small className="muted">{note.source || source} / {time(note.created)}</small></div><span>{reading === note.id ? 'Reading...' : <ArrowUpRight size={17} />}</span></button>)}</div> : <Empty icon={Search} title="No matching notes" />}{nextCursor !== null && <button className="secondary-button memory-load-more" disabled={busy || reading !== null} onClick={() => retrieve(null, true, nextCursor)}><ArrowDown size={16} />Load more notes</button>}</>}{result !== null && <pre className="literal-result">{result}</pre>}</div>
   </section><Goals snapshot={snapshot} inspect={inspect} /></>;
 }
 
@@ -252,39 +262,99 @@ function Troubleshooting({refreshSnapshot}) {
   </section>;
 }
 
-function App() {
-  const {snapshot, state, paused, setPaused, received, refresh} = useSnapshot();
-  const [section, setSection] = useState(sectionFromHash), [detail, setDetail] = useState(null), [mobileNav, setMobileNav] = useState(false);
-  useEffect(() => { const onHash = () => { setSection(sectionFromHash()); setDetail(null); setMobileNav(false); }; addEventListener('hashchange', onHash); return () => removeEventListener('hashchange', onHash); }, []);
-  const inspect = useCallback(value => setDetail(value), []);
-  const title = sections.find(([id]) => id === section)[1];
-  const connected = state === 'connected';
-  const statusLabel = demo ? 'DEMO / PLAYBACK' : state === 'loading' ? 'Connecting' : state === 'error' ? 'Connection lost' : state === 'offline' ? 'Offline' : paused ? 'Updates paused' : 'Local connection';
-  return <div className="app-shell">
-    <a href="#main" className="skip-link">Skip to content</a>
-    <aside className={`sidebar ${mobileNav ? 'mobile-open' : ''}`}><div className="brand"><span className="brand-icon brand-mark"><img src={helixMark} alt="" width="24" height="24" /></span><strong>HELIX<span>1.0</span></strong><IconButton label="Close navigation" className="mobile-close icon-button" onClick={() => setMobileNav(false)}><X size={19} /></IconButton></div><div className="workspace-label">ENGINE MONITOR</div>
-      <nav aria-label="Primary">{sections.map(([id,label,Icon]) => <a key={id} href={`#${id}`} aria-current={section === id ? 'page' : undefined}><Icon size={18} /><span>{label}</span>{id === 'evidence' && snapshot?.counters.failed > 0 && <span className="nav-count">{number(snapshot.counters.failed)}</span>}{section === id && <ChevronRight size={15} className="nav-chevron" />}</a>)}</nav>
-      <div className="sidebar-footer"><div className="local-indicator"><span className={`small-dot ${connected ? 'green-dot' : ''}`} /><strong>{demo ? 'Playback fixture' : 'Local engine'}</strong><span className="numeric">{snapshot?.version || '1.0.1'}</span></div><div className="privacy-row"><LockKeyhole size={14} /><span>Raw session export <strong>{snapshot?.privacy?.raw_session_export === false ? 'off' : snapshot?.privacy?.raw_session_export === true ? 'on' : 'unknown'}</strong></span></div><div className="privacy-row"><ShieldCheck size={14} /><span>Background models <strong>{snapshot?.privacy?.background_llm === false ? 'off' : snapshot?.privacy?.background_llm === true ? 'on' : 'unknown'}</strong></span></div></div>
-      <ThemeControl />
-    </aside>
-    {mobileNav && <button className="mobile-backdrop" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
-    <div className="main-shell"><header className="topbar"><div className="breadcrumb"><IconButton label="Open navigation" className="mobile-menu icon-button" onClick={() => setMobileNav(true)}><Menu size={20} /></IconButton><span>Engine</span><ChevronRight size={13} /><strong>{title}</strong></div><div className="topbar-controls"><Badge tone={demo ? 'purple' : connected ? 'green' : 'neutral'} dot>{statusLabel}</Badge><span className="snapshot-time numeric" title="Last snapshot received">{demo ? 'PUBLIC FIXTURE' : received ? time(received) : 'No snapshot'}</span><IconButton label={paused ? 'Resume updates' : 'Pause updates'} onClick={() => setPaused(value => !value)} disabled={demo || !snapshot}>{paused ? <Play size={16} /> : <Pause size={16} />}</IconButton><IconButton label="Refresh snapshot" onClick={refresh}><RefreshCw size={16} /></IconButton></div></header>
-      <main id="main" tabIndex={-1}><div className="page-heading"><div><div className="page-label"><span className="section-number">0{sections.findIndex(([id]) => id === section) + 1}</span> LOCAL OPERATIONS</div><h1>{section === 'overview' ? 'Engine overview' : title}</h1><p>{section === 'overview' ? 'Requests, retained evidence, and runtime state.' : section === 'flow' ? 'Current requests and deterministic execution.' : section === 'evidence' ? 'Retained tool results from the local service.' : section === 'memory' ? 'Explicit retrieval and stored context.' : section === 'troubleshooting' ? 'Local connection, integrations, and recovery.' : 'Paired results, known usage, and evidence limits.'}</p></div><div className="engine-status"><span className={`status-ring ${connected && snapshot?.status === 'online' ? 'connected' : ''}`}><Activity size={19} /></span><div><strong>{demo ? 'Recorded snapshot' : connected ? `Engine ${readable(snapshot?.status)}` : state === 'loading' ? 'Connecting to engine' : 'Engine unavailable'}</strong><span>{demo ? 'Synthetic public data' : connected ? paused ? 'Automatic updates paused' : 'Snapshot every 2 seconds' : 'Awaiting local connection'}</span></div></div></div>
-        {demo && <div className="notice playback-notice"><Play size={15} /><strong>DEMO / PLAYBACK</strong><span>Synthetic fixture. No live engine, model calls, or benchmark results.</span></div>}
+const TAB_TITLE = {overview: 'Engine overview', flow: 'Flow', evidence: 'Evidence', troubleshooting: 'Troubleshooting', memory: 'Memory'};
+const INTERNAL_TABS = [['overview', 'Overview'], ['flow', 'Flow'], ['evidence', 'Evidence'], ['troubleshooting', 'Troubleshooting']];
+const PAGES = {
+  live: ['Live', 'What every model is doing right now, and what it costs.'], usage: ['Usage', 'Tokens and cost per model, session and project.'],
+  runs: ['Runs', 'Benchmark results from the configured folder.'], memory: ['Memory', 'Explicit retrieval and stored context.'],
+  skills: ['Skills & flows', 'Search the skills and HELIX flows you can invoke.'], settings: ['Settings', 'Appearance, privacy and engine internals.'],
+};
+const REDIRECT = {overview: 'live', chats: 'live', flow: 'live', benchmarks: 'runs', evidence: 'settings', troubleshooting: 'settings'};
+function parseHash() {
+  const [path] = location.hash.slice(1).split('?');
+  let [route, sub] = path.split('/');
+  if (REDIRECT[route]) { route = REDIRECT[route]; history.replaceState(null, '', `#${route}`); sub = undefined; }
+  if (!PAGES[route]) { route = 'live'; history.replaceState(null, '', '#live'); }
+  return {route, sub};
+}
+function useRoute() {
+  const [value, setValue] = useState(parseHash);
+  useEffect(() => { const onHash = () => setValue(previous => { const next = parseHash(); return previous.route === next.route && previous.sub === next.sub ? previous : next; }); addEventListener('hashchange', onHash); return () => removeEventListener('hashchange', onHash); }, []);
+  return value;
+}
+const demoSaved = {};
+const demoApi = {live: async () => liveFixture(), liveSession: async key => liveSessionFixture(key), usage: async args => usageFixture(args), limits: async () => limitsFixture(),
+  runs: async () => runsFixture(), catalog: async () => catalogFixture(), settings: async () => settingsFixture(demoSaved),
+  saveSettings: async patch => { for (const k of ['privacy', 'sources']) demoSaved[k] = {...(demoSaved[k] || {}), ...(patch[k] || {})}; return settingsFixture(demoSaved); },
+  copy: async text => { try { await navigator.clipboard.writeText(text); } catch {} return true; }};
+
+function Internals({section, snapshot, state, connected, paused, refresh, inspect}) {
+  return <>
+    <div className="page-heading"><div className="engine-status"><span className={`status-ring ${connected && snapshot?.status === 'online' ? 'connected' : ''}`}><Activity size={19} /></span><div><strong>{demo ? 'Recorded snapshot' : connected ? `Engine ${readable(snapshot?.status)}` : state === 'loading' ? 'Connecting to engine' : 'Engine unavailable'}</strong><span>{demo ? 'Synthetic public data' : connected ? paused ? 'Automatic updates paused' : 'Snapshot every 2 seconds' : 'Awaiting local connection'}</span></div></div></div>
+    {section !== 'memory' && <h2 className="internals-title">{TAB_TITLE[section]}</h2>}
         {state === 'error' && <div className="notice error-notice" role="alert"><CircleAlert size={17} /><span>Connection lost.{snapshot ? ' Last snapshot retained.' : ' No snapshot available.'} Refresh after the local engine reconnects.</span></div>}
-        {developmentMonitor && section === 'overview' && snapshot?.monitored_benchmark && <section className="benchmark-strip" aria-label="Development run observation"><Activity size={17} /><div><strong>Development run <span className={`badge ${snapshot.monitored_benchmark.status === 'running' ? 'green' : 'neutral'}`}>{snapshot.monitored_benchmark.status === 'prepared' ? 'Pending' : readable(snapshot.monitored_benchmark.status)}</span></strong><p>{readable(snapshot.monitored_benchmark.phase)}</p></div><span>Issue <strong className="numeric">{number(snapshot.monitored_benchmark.current)}</strong></span><span>Requests <strong className="numeric">{number(snapshot.monitored_benchmark.requests)}</strong></span><a href="#benchmarks">View benchmark <ArrowUpRight size={14} /></a></section>}
-        {section === 'troubleshooting' ? <Troubleshooting refreshSnapshot={refresh} /> : !snapshot ? <section className="connection-state">{state === 'loading' ? <Empty icon={RefreshCw} title="Waiting for engine snapshot">Connecting to the local monitor bridge.</Empty> : <Empty icon={CircleAlert} title="Local engine is offline">Open this monitor through the HELIX desktop app to connect.</Empty>}<button className="secondary-button" onClick={refresh}><RefreshCw size={16} />Retry connection</button><a className="connection-help" href="#troubleshooting"><Wrench size={16} />Troubleshooting</a></section> : <>
+        {developmentMonitor && section === 'overview' && snapshot?.monitored_benchmark && <section className="benchmark-strip" aria-label="Development run observation"><Activity size={17} /><div><strong>Development run <span className={`badge ${snapshot.monitored_benchmark.status === 'running' ? 'green' : 'neutral'}`}>{snapshot.monitored_benchmark.status === 'prepared' ? 'Pending' : readable(snapshot.monitored_benchmark.status)}</span></strong><p>{readable(snapshot.monitored_benchmark.phase)}</p></div><span>Issue <strong className="numeric">{number(snapshot.monitored_benchmark.current)}</strong></span><span>Requests <strong className="numeric">{number(snapshot.monitored_benchmark.requests)}</strong></span><a href="#runs">View benchmark <ArrowUpRight size={14} /></a></section>}
+        {section === 'troubleshooting' ? <Troubleshooting refreshSnapshot={refresh} /> : !snapshot ? <section className="connection-state">{state === 'loading' ? <Empty icon={RefreshCw} title="Waiting for engine snapshot">Connecting to the local monitor bridge.</Empty> : <Empty icon={CircleAlert} title="Local engine is offline">Open this monitor through the HELIX desktop app to connect.</Empty>}<button className="secondary-button" onClick={refresh}><RefreshCw size={16} />Retry connection</button><a className="connection-help" href="#settings/troubleshooting"><Wrench size={16} />Troubleshooting</a></section> : <>
           {(section === 'overview' || section === 'flow') && <ModelState snapshot={snapshot} live={connected && !paused} />}
           {(section === 'overview' || section === 'flow') && <><div className="metrics-strip">{[['Active requests',snapshot.active.length,Activity,'Running now'],['Operations',snapshot.counters.operations,Workflow,'Tool calls recorded'],['Failed operations',snapshot.counters.failed,CircleAlert,'Retained in totals'],['Model calls',snapshot.counters.model_calls,Layers3,'Engine-issued calls'],['Memory lookups',snapshot.counters.memory_lookups,Database,'Explicit retrievals']].map(([label,value,Icon,caption]) => <div className="metric" key={label}><span><Icon size={16} />{label}</span><strong className={label === 'Failed operations' && value > 0 ? 'failure-value' : ''}>{number(value)}</strong><small>{caption}</small></div>)}</div><div className="flow-layout"><EngineGraph snapshot={snapshot} inspect={inspect} /><Runtime snapshot={snapshot} /></div><div className="activity-layout"><ActiveRequests snapshot={snapshot} inspect={inspect} /><Goals snapshot={snapshot} inspect={inspect} compact /></div></>}
           {(section === 'overview' || section === 'flow' || section === 'evidence') && <Operations events={snapshot.events} inspect={inspect} full={section !== 'overview'} />}
           {section === 'memory' && <Memory snapshot={snapshot} inspect={inspect} />}
-          {developmentMonitor && section === 'benchmarks' && <BenchmarkMonitor demo={demo} />}
           {section === 'evidence' && <section className="usage-summary"><Heading title="Engine model usage" /><dl><div><dt>Known input</dt><dd>{number(snapshot.counters.known_input)}</dd></div><div><dt>Known output</dt><dd>{number(snapshot.counters.known_output)}</dd></div><div><dt>Unknown usage</dt><dd>{number(snapshot.counters.unknown_usage)}</dd></div></dl><p>These are engine counters, not usage for the surrounding agent session.</p></section>}
         </>}
-        <footer className="page-footer"><span><ShieldCheck size={14} />{demo ? 'Public fixture only' : 'Local snapshot only'}</span><span>Stored context is not authorization to resume work.</span><span className="numeric">HELIX / 1.0</span></footer>
-      </main>
-    </div><Detail detail={detail} close={() => setDetail(null)} />
-  </div>;
+  </>;
+}
+
+function Shell({route, sub, paused, setPaused, tick, bump}) {
+  const api = demo ? demoApi : typeof window.helix?.live === 'function' ? window.helix : null;
+  const needSnapshot = route === 'memory' || route === 'settings';
+  const {snapshot, state} = useSnapshot(needSnapshot, paused, tick);
+  const [detail, setDetail] = useState(null);
+  const inspect = useCallback(value => setDetail(value), []);
+  const limits = usePoll(async () => expectSchema(await api.limits(), 'helix.limits.v1'), {interval: 60000, enabled: !!api});
+  const today = usePoll(async () => expectSchema(await api.usage({range: 'today', group: 'model'}), 'helix.usage.v1'), {interval: 60000, enabled: !!api});
+  const [shareNote, setShareNote] = useState('');
+  async function share() {
+    try { const r = await window.helix.shareSnapshot(); setShareNote(r?.saved ? 'Snapshot saved. Open the file on your phone or share it through Remote Control.' : 'Snapshot not saved.'); }
+    catch { setShareNote('Snapshot could not be saved.'); }
+  }
+  useEffect(() => setDetail(null), [route, sub]);
+  const connected = state === 'connected';
+  const online = !!api || connected;
+  const status = demo ? 'DEMO / PLAYBACK' : !online ? 'Offline' : paused ? 'Paused' : 'Live';
+  const tone = demo ? 'purple' : online && !paused ? 'green' : 'neutral';
+  const [title, subtitle] = PAGES[route];
+  const section = route === 'memory' ? 'memory' : INTERNAL_TABS.some(([id]) => id === sub) ? sub : 'overview';
+  return <AppContext.Provider value={{paused, tick, api, limits: limits.data}}>
+    <div className="hx-app">
+      <a href="#main" className="skip-link">Skip to content</a>
+      <Rail route={route} mark={helixMark} demo={demo} />
+      <div className="hx-main">
+        <PlanStrip limits={limits.data} todayCost={today.data?.totals?.cost_usd} status={status} tone={tone} paused={paused} pauseDisabled={demo} onPause={() => setPaused(value => !value)} onRefresh={bump} onShare={share} shareDisabled={typeof window.helix?.shareSnapshot !== 'function'} />
+        <main id="main" tabIndex={-1}>
+          <div className="hx-page-head"><h1>{title}</h1><p className="hx-page-sub">{subtitle}</p></div>
+          <p className="hx-toast" role="status" aria-live="polite">{shareNote}</p>
+          {demo && <div className="notice playback-notice"><Play size={15} /><strong>DEMO / PLAYBACK</strong><span>Synthetic fixture. No live engine, model calls, or benchmark results.</span></div>}
+          {route === 'live' && <LiveScreen />}
+          {route === 'usage' && <UsageScreen />}
+          {route === 'runs' && <><RunsScreen />{developmentMonitor && <section aria-label="Development monitor"><h2 className="internals-title">Development monitor</h2><BenchmarkMonitor demo={demo} /></section>}</>}
+          {route === 'skills' && <SkillsScreen />}
+          {(route === 'memory' || route === 'settings') && <>
+            {route === 'settings' && <><SettingsScreen /><h2 className="internals-title section-title">Engine internals</h2></>}
+            {route === 'settings' && <nav className="internals-tabs" aria-label="Engine internals">{INTERNAL_TABS.map(([id, label]) => <a key={id} href={`#settings/${id}`} aria-current={section === id ? 'page' : undefined}>{label}</a>)}</nav>}
+            <Internals section={section} snapshot={snapshot} state={state} connected={connected} paused={paused} refresh={bump} inspect={inspect} /></>}
+          <footer className="page-footer"><span><ShieldCheck size={14} />{demo ? 'Public fixture only' : 'Local snapshot only'}</span><span>Stored context is not authorization to resume work.</span><span className="numeric">HELIX / 1.0</span></footer>
+        </main>
+      </div>
+      <TabBar route={route} />
+      <Detail detail={detail} close={() => setDetail(null)} />
+    </div>
+  </AppContext.Provider>;
+}
+
+function App() {
+  const {route, sub} = useRoute();
+  const [paused, setPaused] = useState(false), [tick, setTick] = useState(0);
+  return <AppContext.Provider value={{paused, tick, api: null, limits: null}}><Shell route={route} sub={sub} paused={paused} setPaused={setPaused} tick={tick} bump={() => setTick(n => n + 1)} /></AppContext.Provider>;
 }
 
 createRoot(document.getElementById('root')).render(<App />);

@@ -1,0 +1,4 @@
+#!/bin/sh
+# bk TAG FILE... : copy each FILE to $BK (default $HELIX_LEAN_HOME/backups/current) as NAME.TAG
+t=$1; shift; d=${BK:-${HELIX_LEAN_HOME:-$HOME/.claude-lean}/backups/current}; mkdir -p "$d"
+for f; do cp -p "$f" "$d/$(basename "$f").$t" || exit 1; done; echo "backed up $# file(s) as .$t"

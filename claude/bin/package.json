@@ -1,0 +1,1 @@
+{"private": true, "description": "No type field: lets node detect CommonJS (web) vs ESM (hx) per file, overriding the repo-level type=module."}

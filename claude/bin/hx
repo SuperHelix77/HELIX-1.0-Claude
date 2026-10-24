@@ -1,0 +1,420 @@
+#!/usr/bin/env node
+// hx: run a whole multi-step job in ONE tool call (hx -h for the script syntax). Steps run in order; results are addressable.
+// It stops at the first failure without allow_fail and never retries except an explicit agent escalate. Logs: $HELIX_LEAN_HOME/offload/hx-ID.json.
+import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path'; import {spawn, spawnSync} from 'node:child_process'; import crypto from 'node:crypto'; import {pathToFileURL, fileURLToPath} from 'node:url';
+const ORIG_HELIX_HOME = process.env.HELIX_HOME;   // children get the caller's own value; only this process talks to the Claude-side service
+process.env.HELIX_HOME ||= path.join(os.homedir(), '.helix-claude');
+const LEAN = process.env.HELIX_LEAN_HOME || path.join(os.homedir(), '.claude-lean');
+const engine = process.env.HELIX_ENGINE || path.resolve(path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))), '..', '..');   // repo root (claude/bin/hx -> ../..)
+let helix;
+const [first, ...rest] = process.argv.slice(2);
+const FLOWS = path.join(LEAN, 'hx.d'), LOGS = path.join(LEAN, 'offload');
+const plain = v => v && typeof v === 'object' && !Array.isArray(v) ? ('code' in v && 'out' in v ? v.out : 'status' in v && 'text' in v ? v.text : v) : v;   // bare ref to sh/fetch -> its text
+const USAGE = `hx: a whole job in one tool call. Script on stdin, one step per line:
+  [name:] read FILE [A-B] | read FILE:SYMBOL | include FLOW 'arg' ... (inline a saved flow) | wait BGID | grep REGEX [-- PATHS] | edit FILE (body: OLD, =====, NEW; %%%%% between blocks) | write FILE (body)
+  [name:] test CMD (quiet receipt; never stops the chain unless allow_fail: false) | sh CMD | fetch URL | browse URL | search QUERY | haiku|sonnet|opus TASK | memory|context|goal {json}
+  [name:] skill NAME (a skill's SKILL.md body, no frontmatter; pass it on as {{name}}) | glob PATTERN (git-aware file list, capped) | ls DIR
+  [name:] recall QUERY (memory search here) | note KIND TITLE :: BODY (memory put)
+  & STEP           parallel with the step above
+  " key: value"    (1-3 space indent) modifier on the step above: fresh bg digest check escalate when unless allow_fail quiet max show brief cwd timeout effort turns budget js click fill shot mobile dark stdin
+  "    text"       (4+ spaces) continues the step text on a new line;  # comment
+  when/unless: [!]{{ref}} or {{ref}} OP VALUE, OP in == != > < >= <= ~(regex), e.g.  when: {{t.code}} != 0
+  {{name.path}} {{N.path}} pass results (one quoted word inside sh); sh also sees $HX_<name>
+  bg: true starts sh/test in the background ({{x.bg}} is its id); digest: INSTRUCTION has Haiku condense a big output; fresh: true reprints an unchanged read
+A failed test also shows the code at each project frame; a missed edit shows the closest lines. {{ID.step.path}} reads an earlier run's result.
+Also: hx skill list [QUERY] (name and description of installed skills) | hx skill NAME (body, 12k chars shown, rest via hx log) | hx resume ID [N] [<fixed steps] (rerun from the failed or Nth step, earlier results reused) | hx stats | hx wait BGID [s] | hx chain JSON|- | hx TOOL JSON | hx save NAME <script ({{$1}}.. args) | hx NAME args | hx log ID [step] [regex] | hx -h`;
+const TYPES = new Set(['include', 'wait', 'read', 'grep', 'edit', 'write', 'test', 'sh', 'fetch', 'browse', 'search', 'haiku', 'sonnet', 'opus', 'memory', 'context', 'goal', 'recall', 'note', 'skill', 'glob', 'ls']);
+const MOD = /^ {1,3}(fresh|bg|digest|check|escalate|when|unless|allow_fail|quiet|max|show|brief|cwd|timeout|effort|turns|budget|js|click|fill|shot|mobile|dark|stdin):?(?:\s+(.*))?$/;
+function setMod(s, k, v = '') {
+  v = v.trim();
+  if (['quiet', 'allow_fail', 'mobile', 'dark', 'fresh', 'bg'].includes(k)) s[k] = v !== 'false';
+  else if (['max', 'timeout', 'turns', 'budget'].includes(k)) s[k] = Number(v);
+  else if (k === 'brief') s[k] = v === 'false' ? false : Number(v);
+  else if (k === 'escalate') s[k] = v.split(/[\s,]+/).filter(Boolean);
+  else if (k === 'click') (s.click ||= []).push(v);
+  else if (k === 'fill') { const i = v.indexOf('='); (s.fill ||= {})[v.slice(0, i)] = v.slice(i + 1); }
+  else s[k] = v;
+}
+function parseScript(text) {   // terse line syntax -> the same step objects hx chain takes
+  const steps = [], project = path.basename(process.cwd()); let cur = null;
+  for (const [n, line] of text.split('\n').entries()) {
+    const at = `line ${n + 1}: `;
+    if (!line.trim() || line.startsWith('#')) continue;
+    if (/^( {4,}|\t)/.test(line)) { if (!cur) throw new Error(at + 'continuation before any step');
+      const [o, k] = cur.__k; o[k] += '\n' + line.replace(/^( {4}|\t)/, ''); continue; }
+    const m = MOD.exec(line);
+    if (m) { if (!cur) throw new Error(at + 'modifier before any step'); setMod(cur, m[1], m[2]); continue; }
+    if (/^\s/.test(line)) throw new Error(at + 'unknown modifier ' + line.trim());
+    let l = line, par = false, name;
+    if (l.startsWith('&')) { par = true; l = l.slice(1).trimStart(); }
+    const nm = /^([A-Za-z_][\w-]*):\s+(\S+)/.exec(l); if (nm && TYPES.has(nm[2])) { name = nm[1]; l = l.slice(l.indexOf(':') + 1).trimStart(); }
+    const sp = l.search(/\s/), type = sp < 0 ? l : l.slice(0, sp), arg = sp < 0 ? '' : l.slice(sp + 1).trim();
+    if (!TYPES.has(type)) throw new Error(at + 'unknown step type ' + type + ' (hx -h)');
+    let s;
+    if (type === 'include') { const toks = [...arg.matchAll(/'([^']*)'|"([^"]*)"|(\S+)/g)].map(m => m[1] ?? m[2] ?? m[3]); const f = path.join(FLOWS, toks[0] + '.hx');
+      if (!fs.existsSync(f)) throw new Error(at + 'no saved flow ' + toks[0]);
+      const sub = parseScript(fs.readFileSync(f, 'utf8').replace(/\{\{\$(\d+)\}\}/g, (_, n) => toks[n] ?? ''));
+      steps.push(...sub); cur = sub.at(-1); continue; }
+    if (type === 'wait') { s = {wait: arg}; s.__k = [s, 'wait']; }
+    else if (type === 'read') { const [f, range] = arg.split(/\s+/); s = {read: f, range}; s.__k = [s, 'range']; }
+    else if (type === 'grep') { const i = arg.indexOf(' -- '); s = i < 0 ? {grep: arg} : {grep: arg.slice(0, i), path: arg.slice(i + 4)}; s.__k = [s, 'grep']; }
+    else if (type === 'edit' || type === 'write') { s = {[type]: arg, body: ''}; s.__k = [s, 'body']; }
+    else if (['test', 'sh', 'fetch', 'browse', 'search', 'skill', 'glob', 'ls'].includes(type)) { s = {[type]: arg}; s.__k = [s, type]; }
+    else if (['haiku', 'sonnet', 'opus'].includes(type)) { s = {agent: arg, model: type}; s.__k = [s, 'agent']; }
+    else if (type === 'recall') { s = {tool: 'memory', arguments: {action: 'search', project, query: arg, limit: 5}}; s.__k = [s.arguments, 'query']; }
+    else if (type === 'note') { const q = /^(\w+)\s+(.+?)\s+::\s*([\s\S]*)$/.exec(arg); if (!q) throw new Error(at + 'note KIND TITLE :: BODY');
+      s = {tool: 'memory', arguments: {action: 'put', project, task: 'hx', kind: q[1], title: q[2], body: q[3]}}; s.__k = [s.arguments, 'body']; }
+    else { s = {tool: type, __json: arg || '{}'}; s.__k = [s, '__json']; }
+    if (type === 'test') s.allow_fail = true;   // a test result is something to branch on, not a reason to stop
+    if (name) s.as = name;
+    if (par && steps.length) { const i = steps.length - 1; if (!steps[i].parallel) steps[i] = {parallel: [steps[i]]}; steps[i].parallel.push(s); }
+    else steps.push(s);
+    cur = s;
+  }
+  const done = s => { delete s.__k; if ('__json' in s) { try { s.arguments = JSON.parse(s.__json); } catch (e) { throw new Error(`${s.tool} args: bad JSON (${e.message})`); } delete s.__json; } (s.parallel || []).forEach(done); };
+  steps.forEach(done); return steps;
+}
+function showLog(id, which, pat) {
+  const f = fs.readdirSync(LOGS).find(x => x === `hx-${id}.json`); if (!f) { console.error('hx: no log ' + id); process.exit(2); }
+  const {steps: st, results: rs} = JSON.parse(fs.readFileSync(path.join(LOGS, f), 'utf8'));
+  if (which === undefined) { st.forEach((x, i) => console.log(`[${x.as || i}] ${Object.keys(x).filter(k => k !== 'as')[0]} ${JSON.stringify(rs[i] ?? null).length} chars`)); return; }
+  const i = /^\d+$/.test(which) ? Number(which) : st.findIndex(x => x.as === which); let t = plain(rs[i]); t = typeof t === 'string' ? t : JSON.stringify(t, null, 1);
+  if (t?.length) for (const ln of t.split('\n')) if (!pat || new RegExp(pat).test(ln)) console.log(ln);
+}
+
+// A failed test also prints the code at each project frame (innermost first), so the next call need not read it.
+function failureContext(text, cmd, cwd) {
+  const roots = [cwd || process.cwd()]; const m = /(\S*\/)?pyrun\b/.exec(cmd || ''); if (m) roots.unshift(path.resolve(cwd || '.', (m[1] || './') + 'repo'));
+  const frames = [], re = /File "([^"]+)", line (\d+)|^([\w./-]+\.py):(\d+):/gm; let x;
+  while ((x = re.exec(text))) frames.push([x[1] || x[3], Number(x[2] || x[4])]);
+  const seen = new Set(), out = [];
+  for (const [f0, n] of frames.reverse()) {
+    if (/site-packages|\/lib\/python|<frozen|<string>|\/pytest\/|\/_pytest\//.test(f0)) continue;
+    const rel = f0.replace(/^\/testbed\//, ''); let file = null;
+    for (const r of roots) { const c = path.isAbsolute(rel) ? rel : path.join(r, rel); if (fs.existsSync(c)) { file = c; break; } }
+    if (!file || seen.has(file + ':' + n)) continue; seen.add(file + ':' + n);
+    const lines = fs.readFileSync(file, 'utf8').split('\n'), lo = Math.max(1, n - 3), hi = Math.min(lines.length, n + 3);
+    out.push(`${rel}:${n}\n` + lines.slice(lo - 1, hi).map((l, j) => `${lo + j === n ? '>' : ' '}${lo + j}\t${l}`).join('\n'));
+    if (out.length >= 3) break;
+  }
+  return out.length ? '\ncode at the failure (innermost first):\n' + out.join('\n') : '';
+}
+// A missed edit shows the closest lines (and whether only indentation differs), so the retry needs no extra read.
+function editMiss(file, body, cwd) {
+  let src; try { src = fs.readFileSync(path.resolve(cwd || '.', file), 'utf8').split('\n'); } catch { return ''; }
+  const sim = (a, b) => { a = a.trim().slice(0, 200); b = b.trim().slice(0, 200); if (!a || !b) return 0; if (a === b) return 1;
+    let prev = Array.from({length: b.length + 1}, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) { const cur = [i]; for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; }
+    return 1 - prev[b.length] / Math.max(a.length, b.length); };
+  const out = [];
+  body.replace(/^\n/, '').split(/^%%%%%$/m).forEach((blk, bi) => {
+    const old = blk.split(/^=====$/m)[0].split('\n').filter(l => l.trim()); if (!old.length) return;
+    let best = -1, bs = 0; src.forEach((l, i) => { if (Math.abs(l.trim().length - old[0].trim().length) > 60) return; const v = sim(l, old[0]); if (v > bs) { bs = v; best = i; } });
+    if (best < 0 || bs < 0.5) { out.push(`block ${bi + 1}: no line resembles "${old[0].trim().slice(0, 60)}"`); return; }
+    const lo = Math.max(0, best - 1), hi = Math.min(src.length, best + old.length + 1);
+    const ws = old.every((l, k) => src[best + k]?.trim() === l.trim()) && old.some((l, k) => src[best + k] !== l) ? ' (same text, different indentation)' : '';
+    out.push(`block ${bi + 1}: closest at line ${best + 1}, ${Math.round(bs * 100)}% similar${ws}:\n` + src.slice(lo, hi).map((l, j) => `${lo + j + 1}\t${l}`).join('\n'));
+  });
+  return out.length ? '\n' + out.join('\n') : '';
+}
+// {{ID.step.path}} reads a step result from an earlier hx run's log.
+const extLogs = {};
+function extLog(id) { if (!(id in extLogs)) { try { extLogs[id] = JSON.parse(fs.readFileSync(path.join(LOGS, `hx-${id}.json`), 'utf8')); } catch { extLogs[id] = null; } } return extLogs[id]; }
+function extStep(log, key) { const i = /^\d+$/.test(key) ? Number(key) : log.steps.findIndex(x => x.as === key);
+  if (i >= 0) return log.results[i];
+  for (const [j, x] of log.steps.entries()) if (x.parallel) { const k = x.parallel.findIndex(y => y.as === key); if (k >= 0) return log.results[j]?.[k]; } return undefined; }
+const kindOf = st => st.parallel ? 'parallel' : st.tool ? 'tool' : st.agent ? 'agent:' + (st.model || 'sonnet') : ['read', 'grep', 'edit', 'write', 'test', 'sh', 'fetch', 'browse', 'search', 'wait'].find(k => st[k] !== undefined) || '?';
+function stats(limit) {
+  const files = fs.readdirSync(LOGS).filter(f => /^hx-[0-9a-z]+\.json$/.test(f)).map(f => path.join(LOGS, f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs).slice(0, limit);
+  const kinds = {}, grams = {}, fails = {}; let runs = 0, nsteps = 0, failed = 0;
+  for (const f of files) { let L; try { L = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { continue; } runs++;
+    const ks = (L.steps || []).map(kindOf); nsteps += ks.length; ks.forEach(k => kinds[k] = (kinds[k] || 0) + 1);
+    if (L.failed >= 0) { failed++; const k = ks[L.failed]; fails[k] = (fails[k] || 0) + 1; }
+    for (let n = 2; n <= 4; n++) for (let i = 0; i + n <= ks.length; i++) { const g = ks.slice(i, i + n).join(' > '); grams[g] = (grams[g] || 0) + 1; } }
+  const top = (o, n) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => `${v}x ${k}`).join(', ');
+  console.log(`hx stats: ${runs} runs, ${nsteps} steps, ${failed} stopped early\n  step kinds: ${top(kinds, 10)}\n  stopped at: ${top(fails, 5) || 'none'}`);
+  const rep = Object.entries(grams).filter(([g, v]) => v >= 3 && g.split(' > ').length >= 3).sort((a, b) => b[1] * b[0].length - a[1] * a[0].length).slice(0, 5);
+  console.log(rep.length ? '  candidate flows (save with hx save NAME):\n' + rep.map(([g, v]) => `    ${v}x ${g}`).join('\n') : '  no sequence of 3+ steps repeats 3+ times yet');
+  console.log('  saved flows: ' + (fs.existsSync(FLOWS) ? fs.readdirSync(FLOWS).filter(f => f.endsWith('.hx')).map(f => f.slice(0, -3)).join(', ') : 'none'));
+}
+let START = 0, RESUME = null;
+const readIn = a => a === undefined || a === '-' ? fs.readFileSync(0, 'utf8') : a;
+let steps;
+try {
+  if (first === '-h' || first === '--help') { console.log(USAGE); process.exit(0); }
+  if (first === 'log') { showLog(rest[0], rest[1], rest[2]); process.exit(0); }
+  if (first === 'stats') { stats(Number(rest[0] || 500)); process.exit(0); }
+  if (first === 'resume') { const L = extLog(rest[0]); if (!L) throw new Error('no log ' + rest[0]);
+    START = rest[1] !== undefined ? Number(rest[1]) : L.failed; if (!(START >= 0)) throw new Error(`log ${rest[0]} did not stop early; pass a step index`);
+    const t = process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8'); const tail = t.trim() ? parseScript(t) : L.steps.slice(START);
+    steps = [...L.steps.slice(0, START), ...tail]; RESUME = L; }
+  else
+  if (first === 'wait') { const r = await waitBg(rest[0], Number(rest[1] || 900)); console.log((r.out.split('\n').slice(-60).join('\n') + (r.err ? '\n' + r.err : '')).trim() + `\n[exit ${r.code}]`); process.exit(r.code === 0 ? 0 : 1); }
+  if (first === 'save') { const t = readIn(); parseScript(t.replace(/\{\{\$\d+\}\}/g, 'x')); fs.mkdirSync(FLOWS, {recursive: true});
+    fs.writeFileSync(path.join(FLOWS, rest[0] + '.hx'), t); console.log(`hx: saved ${rest[0]}`); process.exit(0); }
+  if (RESUME) { /* steps set by resume */ } else if (first === 'chain') steps = JSON.parse(readIn(rest[0]));
+  else if (first === 'skill') { if (!rest.length) throw new Error('hx skill list [QUERY] | hx skill NAME'); steps = [{skill: rest.join(' '), max: 12000}]; }
+  else if (first && fs.existsSync(path.join(FLOWS, first + '.hx'))) steps = parseScript(fs.readFileSync(path.join(FLOWS, first + '.hx'), 'utf8').replace(/\{\{\$(\d+)\}\}/g, (_, n) => rest[n - 1] ?? ''));
+  else if (first && ['memory', 'context', 'goal'].includes(first)) steps = [{tool: first, arguments: JSON.parse(readIn(rest[0] ?? '{}'))}];
+  else if (!first) { if (process.stdin.isTTY) { console.log(USAGE); process.exit(2); } steps = parseScript(fs.readFileSync(0, 'utf8')); }
+  else throw new Error(`unknown command or flow ${first} (hx -h)`);
+} catch (e) { console.error('hx: ' + e.message); process.exit(2); }
+if (!Array.isArray(steps) || !steps.length) { console.error('hx: chain needs a non-empty array'); process.exit(2); }
+
+const results = []; const named = {};
+const lookup = (ref, soft) => { const [h, ...keys] = ref.split('.'); let v = /^\d+$/.test(h) ? results[Number(h)] : named[h];
+  if (v === undefined && keys.length && /^[0-9a-z]{6,10}$/.test(h) && extLog(h)) { v = extStep(extLog(h), keys.shift()); }
+  if (!keys.length && v !== undefined) return plain(v);
+  if (v === undefined) { if (soft) return undefined; throw new Error(`{{${ref}}}: no result named ${h} yet`); }
+  for (const k of keys) { v = v?.[k]; if (v === undefined) { if (soft) return undefined; throw new Error(`{{${ref}}}: missing ${k}`); } } return v; };
+const fill = (v) => typeof v === 'string' ? (/^\{\{([\w.-]+)\}\}$/.test(v) ? lookup(v.slice(2, -2)) : v.replace(/\{\{([\w.-]+)\}\}/g, (_, r) => { const x = lookup(r); return typeof x === 'string' ? x : JSON.stringify(x); }))
+  : Array.isArray(v) ? v.map(fill) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fill(x)])) : v;
+const isTrue = v => !(v === undefined || v === null || v === false || v === 0 || v === '' || v === '0' || v === 'false' || (Array.isArray(v) && !v.length));
+// when/unless: [!]A, or A OP B with OP one of == != >= <= > < ~ (regex). Refs resolve softly: a missing ref is empty, never an error.
+const cond = (expr) => {
+  let e = String(expr).trim(), neg = false; if (e.startsWith('!')) { neg = true; e = e.slice(1).trim(); }
+  const val = t => { t = t.trim(); const m = /^\{\{([\w.-]+)\}\}$/.exec(t); if (m) return lookup(m[1], true);
+    return t.replace(/\{\{([\w.-]+)\}\}/g, (_, r) => { const x = lookup(r, true); return x === undefined ? '' : typeof x === 'string' ? x : JSON.stringify(x); }); };
+  const str = v => v === undefined || v === null ? '' : typeof v === 'string' ? v.trim() : JSON.stringify(v);
+  const m = /^(.*?)\s*(==|!=|>=|<=|~|>|<)\s*(.*)$/.exec(e); let r;
+  if (!m) r = isTrue(val(e));
+  else { const a = str(val(m[1])), b = str(val(m[3])), an = Number(a), bn = Number(b), num = a !== '' && b !== '' && !isNaN(an) && !isNaN(bn);
+    r = m[2] === '~' ? new RegExp(b.replace(/^\/(.*)\/$/, '$1')).test(a) : m[2] === '==' ? (num ? an === bn : a === b) : m[2] === '!=' ? (num ? an !== bn : a !== b)
+      : num && (m[2] === '>' ? an > bn : m[2] === '<' ? an < bn : m[2] === '>=' ? an >= bn : an <= bn); }
+  return neg ? !r : r; };
+const ENV_CAP = 65536;   // per variable; the full result stays in the log (keeps child spawns under ARG_MAX)
+const envVal = r => { r = plain(r); const t = typeof r === 'string' ? r : JSON.stringify(r); return t.length > ENV_CAP ? t.slice(0, ENV_CAP) : t; };
+const envOf = () => { const e = {}; results.forEach((r, i) => { e['HX_' + i] = envVal(r); });
+  for (const [k, r] of Object.entries(named)) e['HX_' + k.replace(/\W/g, '_')] = envVal(r); return e; };
+const parse = (t) => { try { return JSON.parse(t); } catch { return undefined; } };
+
+function run(cmd, args, {stdin, cwd, timeout, env}) {
+  return new Promise((resolve) => {
+    const base = {...process.env}; if (ORIG_HELIX_HOME === undefined) delete base.HELIX_HOME; else base.HELIX_HOME = ORIG_HELIX_HOME;
+    const p = spawn(cmd, args, {cwd: cwd || process.cwd(), env: {...base, ...env}, stdio: ['pipe', 'pipe', 'pipe']});
+    let out = '', err = '', killed = false;
+    const t = setTimeout(() => { killed = true; p.kill('SIGTERM'); }, (timeout || 300) * 1000);
+    p.stdout.on('data', d => { out += d; }); p.stderr.on('data', d => { err += d; });
+    p.on('error', e => { clearTimeout(t); resolve({code: 127, out, err: err + e.message}); });
+    p.on('close', code => { clearTimeout(t); resolve({code: killed ? 124 : code, out: out.replace(/\n$/, ''), err: killed ? err + `\nhx: timed out after ${timeout || 300}s` : err}); });
+    p.stdin.end(stdin ?? '');
+  });
+}
+const htmlText = (h) => h.replace(/<(script|style|noscript|svg)[\s\S]*?<\/\1>/gi, ' ').replace(/<br\s*\/?>|<\/(p|div|li|h\d|tr)>/gi, '\n')
+  .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+  .replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim();
+
+const CAPN = 200;
+function globStep(pat, cwd) {   // git-aware: tracked + untracked-not-ignored files; falls back to a node glob outside a repo
+  const base = path.resolve(cwd || '.'); let files;
+  const g = spawnSync('git', ['ls-files', '-co', '--exclude-standard', '--', ':(glob)' + pat], {cwd: base, encoding: 'utf8'});
+  if (g.status === 0) files = [...new Set(g.stdout.split('\n').filter(Boolean))].filter(f => fs.existsSync(path.join(base, f)));
+  else { try { files = fs.globSync(pat, {cwd: base, exclude: d => ['node_modules', '.git'].includes(path.basename(String(d.name ?? d)))}).filter(f => { try { return fs.statSync(path.join(base, f)).isFile(); } catch { return false; } }); }
+    catch (e) { return {value: 'glob: ' + e.message, ok: false, kind: 'glob'}; } }
+  files.sort();
+  return {value: files.length ? files.slice(0, CAPN).join('\n') + (files.length > CAPN ? `\n…+${files.length - CAPN} more (narrow the pattern)` : '') : '(no matches)', ok: true, kind: 'glob'};
+}
+function lsStep(dir, cwd) {
+  const d = path.resolve(cwd || '.', dir.replace(/^~(?=\/|$)/, os.homedir()));
+  try { const es = fs.readdirSync(d, {withFileTypes: true}).sort((a, b) => a.name.localeCompare(b.name));
+    const lines = es.map(e => { if (e.isDirectory()) return e.name + '/'; try { return `${e.name}  ${fs.statSync(path.join(d, e.name)).size}`; } catch { return e.name; } });
+    return {value: lines.slice(0, CAPN).join('\n') + (lines.length > CAPN ? `\n…+${lines.length - CAPN} more` : '') || '(empty)', ok: true, kind: 'ls'};
+  } catch (e) { return {value: 'ls: ' + e.message, ok: false, kind: 'ls'}; }
+}
+function parseFront(txt) {   // -> {name, description, body}
+  const m = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)([\s\S]*)$/.exec(txt); if (!m) return {body: txt};
+  const out = {}, lines = m[1].split('\n');
+  for (let i = 0; i < lines.length; i++) { const k = /^([\w-]+):\s*(.*)$/.exec(lines[i]); if (!k) continue; let v = k[2].trim();
+    if (/^[>|][+-]?$/.test(v) || v === '') { const parts = []; while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) parts.push(lines[++i].trim()); v = parts.join(' '); }
+    out[k[1]] = v.replace(/^(["'])([\s\S]*)\1$/, '$2'); }
+  return {name: out.name, description: out.description, body: m[2]};
+}
+function skillFiles() {   // project first, then user, then plugins; first name wins
+  const home = os.homedir(), res = [];
+  const addDir = d => { try { for (const e of fs.readdirSync(d, {withFileTypes: true})) { const f = path.join(d, e.name, 'SKILL.md'); if (e.isDirectory() && fs.existsSync(f)) res.push(f); } } catch {} };
+  let top = process.cwd(); const g = spawnSync('git', ['rev-parse', '--show-toplevel'], {encoding: 'utf8'}); if (g.status === 0) top = g.stdout.trim();
+  addDir(path.join(process.cwd(), '.claude', 'skills')); if (top !== process.cwd()) addDir(path.join(top, '.claude', 'skills'));
+  addDir(path.join(home, '.claude', 'skills'));
+  const walk = (d, depth) => { if (depth > 8) return; let es; try { es = fs.readdirSync(d, {withFileTypes: true}); } catch { return; }
+    for (const e of es) { if (!e.isDirectory() || e.name === 'node_modules' || e.name === '.git') continue; const p = path.join(d, e.name);
+      if (e.name === 'skills') addDir(p); else walk(p, depth + 1); } };
+  walk(path.join(home, '.claude', 'plugins'), 0);
+  return res;
+}
+function skillIndex() {
+  const seen = new Map();
+  for (const f of skillFiles()) { let fm; try { fm = parseFront(fs.readFileSync(f, 'utf8')); } catch { continue; }
+    const name = fm.name || path.basename(path.dirname(f)); if (!seen.has(name)) seen.set(name, {name, description: (fm.description || '').replace(/\s+/g, ' '), file: f, body: fm.body}); }
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+function skillCmd(arg) {   // 'list [QUERY]' | NAME -> {text, ok}
+  const idx = skillIndex(), lm = /^list(?:\s+(.*))?$/.exec(arg);
+  if (lm) { const q = (lm[1] || '').trim().toLowerCase(); const hit = idx.filter(s => !q || (s.name + ' ' + s.description).toLowerCase().includes(q));
+    return {ok: true, text: hit.length ? hit.map(s => `${s.name}: ${s.description.slice(0, 160)}`).join('\n') : '(no skills match)'}; }
+  const s = idx.find(x => x.name === arg) || idx.find(x => x.name.toLowerCase() === arg.toLowerCase()) || idx.find(x => x.name.endsWith(':' + arg));
+  if (!s) return {ok: false, text: `no skill ${arg}; hx skill list [QUERY]`};
+  return {ok: true, text: s.body.replace(/^\s*\n/, '').trimEnd()};
+}
+async function exec(step) {   // -> {value, ok, kind}
+  if (step.parallel) { const rs = await Promise.all(step.parallel.map(s => exec(fillStep(s))));
+    return {value: rs.map(r => r.value), oks: rs.map(r => r.ok), notes: rs.map(r => r.note), ok: rs.every((r, j) => r.ok || step.parallel[j].allow_fail), kind: 'parallel'}; }
+  if (step.tool) {
+    helix ||= await import(pathToFileURL(path.join(engine, 'src', 'connection.mjs')).href).then(async m => { await m.ensureService(); return m; });
+    const args = {...(step.arguments || {})}; if (step.tool === 'memory') args.caller_cwd ??= process.cwd();
+    try { const res = await helix.request('/rpc', {value: {method: 'tools/call', params: {name: step.tool, arguments: args}}});
+      const text = (res.content || []).map(c => c.text ?? '').join('\n'); return {value: parse(text) ?? text, ok: !res.isError, kind: step.tool}; }
+    catch (e) { return {value: e.message, ok: false, kind: step.tool}; }
+  }
+  if (step.read !== undefined && /:[A-Za-z_][\w.]*$/.test(step.read) && !fs.existsSync(path.resolve(step.cwd || '.', step.read))) {
+    const i = step.read.lastIndexOf(':'); const r = await run(path.join(LEAN, 'bin', 'sym'), [step.read.slice(0, i), step.read.slice(i + 1)], {cwd: step.cwd});
+    return {value: r.code === 0 ? r.out : (r.out + r.err).trim(), ok: r.code === 0 && !!r.out.trim(), kind: 'read'}; }
+  if ((step.sh !== undefined || step.test !== undefined) && step.bg) {   // background: returns at once; a later wait step collects it
+    const id = `${LOG_ID}-${bgSeq++}`, base = path.join(LOGS, `hx-bg-${id}`), cmd = step.sh ?? `${path.join(LEAN, 'bin', 'q')} ${"'" + step.test.replace(/'/g, "'\\''") + "'"}`;
+    const base0 = {...process.env}; if (ORIG_HELIX_HOME === undefined) delete base0.HELIX_HOME; else base0.HELIX_HOME = ORIG_HELIX_HOME;
+    spawn('/bin/zsh', ['-c', `{ ${cmd} ; } > ${base}.out 2>&1; echo $? > ${base}.code`], {cwd: step.cwd || process.cwd(), env: {...base0, ...envOf()}, detached: true, stdio: 'ignore'}).unref();
+    return {value: {bg: id}, ok: true, kind: 'bg'}; }
+  if (step.wait !== undefined) { const r = await waitBg(step.wait, step.timeout || 900); return {value: r, ok: r.code === 0, kind: 'wait'}; }
+  if (step.read !== undefined) { try { const lines = fs.readFileSync(path.resolve(step.cwd || '.', step.read), 'utf8').split('\n');
+      const [a, b] = (step.range || '').split('-').map(Number); const lo = a || 1, hi = b || (a ? a : lines.length);
+      return {value: lines.slice(lo - 1, hi).map((l, j) => `${lo + j}\t${l}`).join('\n'), ok: true, kind: 'read'}; }
+    catch (e) { return {value: e.message, ok: false, kind: 'read'}; } }
+  if (step.grep !== undefined) { const q = t => "'" + t.replace(/'/g, "'\\''") + "'", p = step.path || '';
+    const r = await run('/bin/zsh', ['-c', `{ git rev-parse --git-dir >/dev/null 2>&1 && git grep -n --untracked -E -e ${q(step.grep)} -- ${p}; } || grep -rn -E -e ${q(step.grep)} ${p || '.'}`], {cwd: step.cwd, timeout: step.timeout});
+    return {value: r.code === 1 && !r.err ? '(no matches)' : r, ok: r.code === 0 || (r.code === 1 && !r.err), kind: 'grep'}; }
+  if (step.edit !== undefined) { const r = await run(path.join(LEAN, 'bin', 'pat'), [step.edit], {stdin: step.body.replace(/^\n/, '') + '\n', cwd: step.cwd});
+    if (r.code !== 0) r.err += editMiss(step.edit, step.body, step.cwd);
+    return {value: r, ok: r.code === 0, kind: 'edit'}; }
+  if (step.write !== undefined) { try { const f = path.resolve(step.cwd || '.', step.write); fs.mkdirSync(path.dirname(f), {recursive: true});
+      const body = step.body.replace(/^\n/, '') + '\n'; fs.writeFileSync(f, body); return {value: `wrote ${step.write} ${body.length}B`, ok: true, kind: 'write'}; }
+    catch (e) { return {value: e.message, ok: false, kind: 'write'}; } }
+  if (step.test !== undefined) { const r = await run(path.join(LEAN, 'bin', 'q'), [step.test], {cwd: step.cwd, timeout: step.timeout || 900, env: envOf()});
+    if (r.code !== 0) { const lp = /log=(\S+?)[\s\]]/.exec(r.out)?.[1]; let full = r.out; try { if (lp) full = fs.readFileSync(lp, 'utf8'); } catch {} r.out += failureContext(full, step.test, step.cwd); }
+    return {value: r, ok: r.code === 0, kind: 'test'}; }
+  if (step.sh !== undefined) { const r = await run('/bin/zsh', ['-c', step.sh], {stdin: step.stdin, cwd: step.cwd, timeout: step.timeout, env: envOf()});
+    const j = parse(r.out); return {value: j === undefined ? r : {...r, json: j}, ok: r.code === 0, kind: 'sh'}; }
+  if (step.fetch) {
+    try { const ac = AbortSignal.timeout((step.timeout || 60) * 1000);
+      const res = await fetch(step.fetch, {signal: ac, headers: {'user-agent': 'Mozilla/5.0 hx', ...(step.headers || {})}, redirect: 'follow'});
+      const raw = await res.text(); const ct = res.headers.get('content-type') || '';
+      const text = /html/.test(ct) ? htmlText(raw) : raw;
+      return {value: {status: res.status, url: res.url, text: text.slice(0, step.limit || 200000)}, ok: res.ok, kind: 'fetch'}; }
+    catch (e) { return {value: {status: 0, text: e.message}, ok: false, kind: 'fetch'}; }
+  }
+  if (step.agent) return agentStep(step);
+  if (step.browse) {   // headless Playwright through $HELIX_LEAN_HOME/bin/web: same actions as the browser pane, no pane
+    const a = [step.browse]; if (step.mobile) a.push('--mobile'); if (step.dark) a.push('--dark');
+    for (const sel of [].concat(step.click || [])) a.push('--click', sel);
+    for (const [sel, txt] of Object.entries(step.fill || {})) a.push('--fill', `${sel}=${txt}`);
+    if (step.js) a.push('--js', step.js); if (step.text !== false) a.push('--text'); if (step.shot) a.push('--shot', step.shot);
+    const r = await run(path.join(LEAN, 'bin', 'web'), a, {timeout: step.timeout || 120});
+    return {value: r.out || r.err, ok: r.code === 0, kind: 'browse'}; }
+  if (step.skill !== undefined) { const t = skillCmd(step.skill.trim()); return {value: t.text, ok: t.ok, kind: 'skill'}; }
+  if (step.glob !== undefined) return globStep(step.glob.trim(), step.cwd);
+  if (step.ls !== undefined) return lsStep(step.ls.trim() || '.', step.cwd);
+  if (step.search) {
+    const prompt = `Run WebSearch for: ${step.search}\nReply with only the results: one line per result, "title | url | one-sentence fact relevant to the query". No preamble.`;
+    const r = await run('claude', ['-p', prompt, '--model', 'haiku', '--tools', 'WebSearch', '--allowedTools', 'WebSearch', '--strict-mcp-config', '--setting-sources', 'project', '--no-session-persistence', '--output-format', 'json'],
+      {stdin: '', cwd: os.tmpdir(), timeout: step.timeout || 180});
+    let res = null; try { res = JSON.parse(r.out); } catch {} logUsage('search', 'haiku', res); spent += res?.total_cost_usd || 0;
+    const text = (res?.result ?? r.out).trim();
+    return {value: text || r.err.trim(), ok: r.code === 0 && !!text && !res?.is_error, kind: 'search'}; }
+  return {value: 'unknown step: needs tool, sh, fetch, agent, search, browse or parallel', ok: false, kind: '?'};
+}
+let spent = 0, bgSeq = 0;
+async function waitBg(id, timeout) {
+  const base = path.join(LOGS, `hx-bg-${id}`), end = Date.now() + timeout * 1000;
+  if (!fs.existsSync(base + '.out')) return {code: 2, out: '', err: `hx: no background job ${id}`};
+  while (!fs.existsSync(base + '.code') && Date.now() < end) await new Promise(r => setTimeout(r, 300));
+  const out = fs.readFileSync(base + '.out', 'utf8').replace(/\n$/, '');
+  return fs.existsSync(base + '.code') ? {code: Number(fs.readFileSync(base + '.code', 'utf8')), out, err: ''} : {code: 124, out, err: `hx: ${id} still running after ${timeout}s`};
+}
+// digest: a cheap tool-less Haiku call reads a big output and returns a few lines; the raw output stays in the log.
+async function digest(instruction, value) {
+  const v = plain(value), text = (typeof v === 'string' ? v : JSON.stringify(v, null, 1)).slice(0, 150000);
+  const r = await run('claude', ['-p', '--model', 'haiku', '--tools', '', '--strict-mcp-config', '--setting-sources', 'project', '--no-session-persistence', '--output-format', 'json'],
+    {stdin: `${instruction}\nReply in at most 8 lines, facts only; quote exact names, numbers and file:line.\n\n<output>\n${text}\n</output>`, cwd: os.tmpdir(), timeout: 180});
+  let res = null; try { res = JSON.parse(r.out); } catch {} logUsage('digest', 'haiku', res); spent += res?.total_cost_usd || 0;
+  return {text: (res?.result ?? '').trim() || `digest failed: ${(r.err || r.out).slice(-300)}`, chars: text.length, cost: res?.total_cost_usd || 0};
+}
+// Re-read dedup: an unchanged range or symbol already shown in this session prints one line; fresh: true reprints.
+// The seen-store is cleared on compaction or clear by the HELIX adapter, so text is never withheld after context loss.
+const scope = () => { if (process.env.HX_SCOPE || process.env.CLAUDE_CODE_HOST_SESSION_ID) return (process.env.HX_SCOPE || process.env.CLAUDE_CODE_HOST_SESSION_ID).replace(/\W/g, '');
+  try { return 'pid' + String(spawnSync('ps', ['-o', 'ppid=', '-p', String(process.ppid)], {encoding: 'utf8'}).stdout).trim(); } catch { return 'x'; } };
+const SEEN = path.join(LEAN, 'run', 'hx-seen');
+function seenCheck(step, value, label) {
+  if (step.fresh || typeof value !== 'string' || value.length < 200) return null;
+  const f = path.join(SEEN, scope() + '.json'); let db = {}; try { db = JSON.parse(fs.readFileSync(f, 'utf8')); } catch {}
+  const key = path.resolve(step.cwd || '.', step.read) + '|' + (step.range || ''), h = crypto.createHash('sha1').update(value).digest('hex').slice(0, 16);
+  const prev = db[key]; db[key] = {h, at: prev?.h === h ? prev.at : `${LOG_ID} ${label}`};
+  try { fs.mkdirSync(SEEN, {recursive: true}); fs.writeFileSync(f, JSON.stringify(db)); } catch {}
+  return prev?.h === h ? `unchanged since hx log ${prev.at} (${value.split('\n').length} lines; fresh: true reprints)` : null;
+}
+// Under a benchmark lane, every subagent and search run appends its real usage so the lane ledger counts it.
+function logUsage(kind, model, res) {
+  if (!process.env.HX_USAGE_LOG) return;
+  const mu = res && res.modelUsage ? Object.values(res.modelUsage) : null;
+  const tokens = mu ? mu.reduce((t, m) => ({input: t.input + (m.inputTokens || 0), cache_creation: t.cache_creation + (m.cacheCreationInputTokens || 0),
+    cache_read: t.cache_read + (m.cacheReadInputTokens || 0), output: t.output + (m.outputTokens || 0)}), {input: 0, cache_creation: 0, cache_read: 0, output: 0}) : null;
+  try { fs.appendFileSync(process.env.HX_USAGE_LOG, JSON.stringify({kind, model, cost_usd: res?.total_cost_usd ?? null, tokens}) + '\n'); } catch {}
+}
+// Model switch: the caller (Opus) writes the brief; a cheap lean-run model does the work; only a short report comes back.
+// escalate is opt-in and explicit: each listed model runs only if the previous attempt failed or its check failed.
+async function agentStep(step) {
+  const models = [step.model || 'sonnet', ...[].concat(step.escalate || [])]; const notes = []; let last;
+  const task = step.agent + (step.brief === false ? '' : `\n\nEnd with a final report of at most ${step.brief || 15} lines: what you did, files changed, and results with exact numbers. Facts only; no preamble.`);
+  for (const model of models) {
+    const a = ['-m', model, '-e', step.effort || (model === 'haiku' ? 'low' : 'medium'), '-d', step.cwd || process.cwd(), '-t', String(step.turns || 40), '-b', String(step.budget || 2), '-'];
+    const r = await run(path.join(LEAN, 'bin', 'lean-run'), a, {stdin: task, timeout: step.timeout || 900, env: envOf()});
+    const lines = r.out.trim().split('\n'); const stats = /^\[lean-run /.test(lines.at(-1) || '') ? lines.pop() : '';
+    const cost = Number(/cost_usd=([\d.e-]+)/.exec(stats)?.[1] || 0); spent += cost;
+    const logPath = /log=(\S+?)\]?$/.exec(stats)?.[1]; let res = null; try { res = logPath ? JSON.parse(fs.readFileSync(logPath, 'utf8')) : null; } catch {} logUsage('agent', model, res);
+    const text = lines.join('\n').trim() || r.err.trim().slice(-1500);
+    let ok = r.code === 0, check = '';
+    if (ok && step.check) {
+      const c = await run('/bin/zsh', ['-c', step.check], {cwd: step.cwd, timeout: step.check_timeout || 300, env: {...envOf(), HX_AGENT: text.slice(0, 65536)}});
+      ok = c.code === 0; check = `check exit ${c.code}` + ((c.out + c.err).trim() ? ': ' + (c.out + c.err).trim().split('\n').slice(-15).join('\n') : ''); }
+    notes.push(`${model} ${ok ? 'ok' : 'failed'} $${cost.toFixed(4)}` + (check ? ` (${check.split('\n')[0].slice(0, 120)})` : ''));
+    last = {value: check && !ok ? text + '\n' + check : text, ok, kind: 'agent:' + model, note: '[' + notes.join(' -> ') + ']'};
+    if (ok) break;
+  }
+  return last;
+}
+function fillStep(s) {   // resolve refs now, except inside nested parallel steps (each resolves itself)
+  const {parallel, sh, when, unless, ...rest} = s; const f = fill(rest); if (parallel) f.parallel = parallel; if (when !== undefined) f.when = when; if (unless !== undefined) f.unless = unless;
+  if (sh !== undefined) f.sh = sh.replace(/\{\{([\w.-]+)\}\}/g, (_, r) => { const x = lookup(r); const t = typeof x === 'string' ? x : JSON.stringify(x); return "'" + t.replace(/'/g, "'\\''") + "'"; });
+  return f; }
+function render(v, show, max, label = '') {
+  if (show) { for (const k of show.split('.')) v = v?.[k]; }
+  else if (v && typeof v === 'object' && !Array.isArray(v) && 'code' in v && 'out' in v) v = v.out + (v.code ? `\n[exit ${v.code}] ${v.err.slice(-600)}` : '');
+  else if (v && typeof v === 'object' && 'text' in v && 'status' in v) v = `[${v.status}] ${v.text}`;
+  let t = typeof v === 'string' ? v : JSON.stringify(v); t = (t ?? '').trimEnd();
+  return t.length > max ? t.slice(0, max) + `\n…+${t.length - max} (hx log ${LOG_ID} ${label})` : t;
+}
+
+const LOG_ID = Date.now().toString(36).slice(-6) + process.pid.toString(36).slice(-2);
+let failed = -1;
+if (RESUME) for (let i = 0; i < START; i++) { results[i] = RESUME.results[i]; const st = steps[i]; if (st.as) named[st.as] = results[i];
+  if (st.parallel) st.parallel.forEach((x, j) => { if (x.as) named[x.as] = results[i]?.[j]; }); }
+if (RESUME) console.log(`hx: resumed ${RESUME.id || ''} at step ${START}; steps 0-${START - 1} reused`);
+for (const [i, raw] of steps.entries()) {
+  if (i < START) continue;
+  let step, r;
+  try { if ((raw.when !== undefined && !cond(raw.when)) || (raw.unless !== undefined && cond(raw.unless))) { results.push({skipped: true}); if (raw.as) named[raw.as] = results[i]; if (steps.length > 1) console.log(`[${raw.as || i}] skip`); continue; }
+    step = fillStep(raw); r = await exec(step); }
+  catch (e) { r = {value: e.message, ok: false, kind: 'ref'}; step = raw; }
+  results.push(r.value); if (raw.as) named[raw.as] = r.value;
+  if (raw.parallel) raw.parallel.forEach((x, j) => { if (x.as) named[x.as] = r.value[j]; });
+  const label = steps.length > 1 ? `[${raw.as || i}]${r.ok ? '' : ' FAIL'} ` : (r.ok ? '' : 'FAIL ');
+  if (raw.parallel && Array.isArray(r.value)) raw.parallel.forEach((x, j) => { if (!x.quiet || !r.oks?.[j]) { const lb = x.as || `${i}.${j}`;
+    console.log(`[${lb}]${r.oks?.[j] ? '' : ' FAIL'} ` + render(r.value[j], r.oks?.[j] ? x.show : undefined, x.max || 1500, lb) + (r.notes?.[j] ? '\n' + r.notes[j] : '')); } });
+  else if (r.ok && raw.digest) { const d = await digest(raw.digest, r.value); console.log(`${label}${d.text}\n(digest of ${d.chars} chars, $${d.cost.toFixed(4)}; raw: hx log ${LOG_ID} ${raw.as || i})`); }
+  else if (r.ok && r.kind === 'read' && (r.dedup = seenCheck(step, r.value, raw.as || i))) console.log(label + r.dedup);
+  else if (!raw.quiet || !r.ok) {
+    console.log(label + render(r.value, r.ok ? raw.show : undefined, raw.max || (raw.skill !== undefined ? 12000 : raw.read !== undefined || raw.grep !== undefined ? 8000 : 1500), raw.as || i) + (r.note ? '\n' + r.note : ''));
+  }
+  if (!r.ok && !raw.allow_fail) { failed = i; break; }
+}
+const log = path.join(LOGS, `hx-${LOG_ID}.json`);
+try { fs.mkdirSync(path.dirname(log), {recursive: true}); fs.writeFileSync(log, JSON.stringify({id: LOG_ID, failed, cwd: process.cwd(), steps, results}, null, 1)); } catch {}
+if (steps.length > 1 || failed >= 0) console.log((failed >= 0 ? `hx FAIL at ${steps[failed].as || failed}, ${steps.length - failed - 1} not run` : `hx ok ${steps.length}`) + (spent ? ` $${spent.toFixed(4)}` : '') + ` log ${LOG_ID}`);
+process.exit(failed >= 0 ? 1 : 0);
