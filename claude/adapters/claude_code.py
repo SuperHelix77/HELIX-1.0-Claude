@@ -7,7 +7,7 @@ import os,re,sys,json,hashlib,subprocess
 HOME=os.environ.get('HELIX_HOME') or os.environ.get('HELIX_LEAN_HOME') or os.path.expanduser('~/.claude-lean')
 sys.path.insert(0,os.path.join(HOME,'lib'))
 import hmem,consolidate,intercept,offload
-def project_key(cwd): return 'p-'+hashlib.sha256(os.path.abspath(cwd).encode()).hexdigest()[:10]
+def project_key(cwd): return 'p-'+hashlib.sha256(os.path.realpath(cwd).encode()).hexdigest()[:10]   # realpath: /tmp and /private/tmp are one project
 def db_path(): return os.environ.get('HELIX_MEM_DB',os.path.join(HOME,'memory.db'))
 def out(o): print(json.dumps(o))
 def ctx_state(): 
