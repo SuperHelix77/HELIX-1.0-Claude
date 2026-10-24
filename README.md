@@ -65,8 +65,8 @@ Full aggregate: [benchmarks/new50-full-helixy-vs-vanilla-20261024.md](benchmarks
 The engine requirements are the same as for HELIX 1.0: Node.js 22.19 or newer, npm and Git. Python 3 is used by the Claude hook adapter.
 
 ```sh
-git clone -b HELIX-1.0-Claude https://github.com/SuperHelix77/HELIX-1.0.git
-cd HELIX-1.0
+git clone https://github.com/SuperHelix77/HELIX-1.0-Claude.git
+cd HELIX-1.0-Claude
 npm ci
 npm run build
 node bin/helix.mjs start
